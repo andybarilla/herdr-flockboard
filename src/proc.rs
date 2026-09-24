@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -19,9 +19,12 @@ use anyhow::{anyhow, Context, Result};
 /// observed within one tick.
 const POLL: Duration = Duration::from_millis(10);
 
-/// How long the fallback teardown waits to reap the direct child when the
-/// process-group kill itself failed: a last bounded best-effort before the
-/// child is left to the OS and the failure is reported.
+/// How long teardown polls `try_wait` to reap the direct child after
+/// signaling it — after a successful group kill and on the direct-child
+/// fallback path alike. SIGKILL delivery does not prove the child has
+/// exited, and an unbounded `Child::wait` could hang past the timeout
+/// contract, so a child still running when the grace expires is reported
+/// and left to the OS.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// Runs `command` to completion, collecting stdout/stderr, or kills it and
@@ -35,11 +38,15 @@ const TEARDOWN_GRACE: Duration = Duration::from_secs(1);
 /// kill succeeding or on a descendant closing an inherited writer. Every
 /// exit path after spawn (success, timeout, or error) cancels and joins
 /// both readers before returning, and no helper thread or unreaped direct
-/// child of ours outlives the call. If the group kill itself fails for a
-/// non-ESRCH reason (e.g. EPERM from a setuid child), teardown falls back
-/// to a bounded best-effort kill/reap of the direct child only — never
-/// signaling anything outside our own process group — and reports both
-/// failures.
+/// child of ours outlives the call. Reaping the direct child is bounded
+/// too: SIGKILL delivery does not prove the child has exited, so teardown
+/// polls `try_wait` under a grace deadline instead of `Child::wait` and
+/// reports a child still running when the grace expires. If the group
+/// kill itself fails for a non-ESRCH reason (e.g. EPERM from a setuid
+/// child), teardown falls back to SIGKILLing the direct child only —
+/// never signaling anything outside our own process group — and every
+/// teardown failure is chained onto the timeout or wait error that
+/// initiated teardown rather than silently dropped.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output> {
     run_with(command, timeout, kill_process_group)
 }
@@ -68,12 +75,11 @@ fn run_with(
             Ok(None) => {}
             Err(err) => {
                 // The wait itself failed: still tear everything down —
-                // cancel/join the readers and best-effort-terminate the
-                // child, bounded as in the timeout path — so nothing
-                // outlives the error return.
-                readers.cancel_and_join();
-                terminate_tree(&mut child, &kill_group);
-                return Err(err).context("waiting on child");
+                // cancel/join the readers and terminate the tree, bounded
+                // as in the timeout path — so nothing outlives the error
+                // return, and keep any teardown failure chained onto the
+                // wait error instead of silently dropping it.
+                return Err(wait_failed(err, &mut child, readers, &kill_group));
             }
         }
         if Instant::now() >= deadline {
@@ -249,9 +255,9 @@ fn set_nonblocking(fd: std::os::unix::io::RawFd) {
 /// Builds the timeout error after tearing the process tree down. The
 /// readers are cancelled and joined first, so the rest never waits on a
 /// pipe a descendant may still hold. Normally the group SIGKILL closes
-/// every inherited writer and reaping the direct child cannot hang; if
-/// the kill fails for a non-ESRCH reason, teardown degrades to a bounded
-/// best-effort fallback on the direct child and reports both failures.
+/// every inherited writer and the direct child is reaped within the
+/// grace; any kill or reap failure is reported alongside the timeout, so
+/// the caller sees that the tree may still be running or unreaped.
 fn teardown_timed_out(
     child: &mut Child,
     readers: Readers,
@@ -259,47 +265,145 @@ fn teardown_timed_out(
     timeout: Duration,
 ) -> anyhow::Error {
     readers.cancel_and_join();
-    match terminate_tree(child, kill_group) {
-        None => anyhow!("command timed out after {}s", timeout.as_secs()),
-        Some(kill_err) => anyhow!(
-            "command timed out after {}s and killing its process group \
-             failed ({kill_err}); the process tree may still be running",
-            timeout.as_secs()
-        ),
+    let failures = terminate_tree(child, kill_group);
+    if failures.is_empty() {
+        return anyhow!("command timed out after {}s", timeout.as_secs());
+    }
+    anyhow!(
+        "command timed out after {}s and tearing the process tree down \
+         failed ({}); the process tree may still be running or unreaped",
+        timeout.as_secs(),
+        describe_failures(&failures)
+    )
+}
+
+/// Builds the error for a failed `try_wait`: tears everything down first
+/// (cancel/join readers, bounded tree termination, exactly as on the
+/// timeout path) and chains any teardown failure onto the wait error, so
+/// neither is lost — the caller must see both that the wait failed and
+/// that the process tree may still be running or unreaped.
+fn wait_failed(
+    wait_err: std::io::Error,
+    child: &mut Child,
+    readers: Readers,
+    kill_group: &impl Fn(&Child) -> std::io::Result<()>,
+) -> anyhow::Error {
+    readers.cancel_and_join();
+    let failures = terminate_tree(child, kill_group);
+    let err = anyhow::Error::new(wait_err).context("waiting on child");
+    if failures.is_empty() {
+        return err;
+    }
+    err.context(format!(
+        "tearing the process tree down after the wait failure failed \
+         ({}); the process tree may still be running or unreaped",
+        describe_failures(&failures)
+    ))
+}
+
+/// Why the bounded direct-child reap did not complete.
+#[derive(Debug)]
+enum ReapFailure {
+    /// `try_wait` itself errored, so the child's state is unknown.
+    Wait(std::io::Error),
+    /// The grace deadline elapsed with the child still running.
+    GraceExpired,
+}
+
+/// One thing that went wrong while tearing the process tree down. The
+/// failures are collected in the order they happened so callers can
+/// report every one of them, not just the first.
+#[derive(Debug)]
+enum TeardownFailure {
+    /// The process-group SIGKILL failed for a non-ESRCH reason (e.g.
+    /// EPERM); the whole tree may still be running.
+    GroupKill(std::io::Error),
+    /// The fallback SIGKILL of the direct child failed.
+    ChildKill(std::io::Error),
+    /// The bounded direct-child reap did not complete.
+    Reap(ReapFailure),
+}
+
+impl std::fmt::Display for TeardownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GroupKill(err) => write!(f, "killing its process group failed ({err})"),
+            Self::ChildKill(err) => write!(
+                f,
+                "killing the direct child after the group-kill failure failed ({err})"
+            ),
+            Self::Reap(ReapFailure::Wait(err)) => {
+                write!(f, "reaping the direct child failed ({err})")
+            }
+            Self::Reap(ReapFailure::GraceExpired) => write!(
+                f,
+                "the direct child was still running when the teardown grace expired"
+            ),
+        }
     }
 }
 
-/// Terminates the child's process tree without ever waiting indefinitely,
-/// returning the group-kill error if that step failed. The group SIGKILL
-/// reaches every descendant of our own process group and no one else; on
-/// a non-ESRCH failure (e.g. EPERM from a setuid child) the tree may
-/// still be running, so the fallback SIGKILLs only the direct child and
-/// gives it one bounded grace period to be reaped — if it still has not
-/// exited it is left to the OS and the caller reports the failure.
+/// Renders teardown failures for an error message, in order.
+fn describe_failures(failures: &[TeardownFailure]) -> String {
+    failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Polls `try_wait` until the direct child is reaped or `grace` elapses,
+/// whichever comes first. Unlike `Child::wait` this can never hang: a
+/// child still running past the grace (e.g. signaled but slow to die, or
+/// unreapable) is reported instead of awaited forever, and a `try_wait`
+/// error is surfaced rather than silently treated as reaped. The closure
+/// is injectable so tests can drive grace expiry and wait errors without
+/// OS-level tricks.
+fn reap_bounded(
+    mut try_wait: impl FnMut() -> std::io::Result<Option<ExitStatus>>,
+    grace: Duration,
+) -> Result<(), ReapFailure> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Err(err) => return Err(ReapFailure::Wait(err)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return Err(ReapFailure::GraceExpired);
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+}
+
+/// Terminates the child's process tree without ever waiting indefinitely
+/// and reports everything that went wrong, as one list entry per failure
+/// (empty means the tree is dead and the direct child reaped). The group
+/// SIGKILL reaches every descendant of our own process group and no one
+/// else; on a non-ESRCH failure (e.g. EPERM from a setuid child) the tree
+/// may still be running, so the fallback SIGKILLs only the direct child —
+/// never anything outside our own process group. Either way the direct
+/// child is then reaped by `reap_bounded`, because a successful signal
+/// does not prove the child exited: ESRCH is benign for group signaling
+/// only, and an unbounded `Child::wait` could hang past the timeout
+/// contract.
 fn terminate_tree(
     child: &mut Child,
     kill_group: &impl Fn(&Child) -> std::io::Result<()>,
-) -> Option<std::io::Error> {
-    match kill_group(child) {
-        Ok(()) => {
-            // The direct child is in the killed group (or already exited
-            // and its status cached); reap it so no zombie of ours is
-            // left behind.
-            let _ = child.wait();
-            None
-        }
-        Err(kill_err) => {
-            let _ = child.kill();
-            let grace = Instant::now() + TEARDOWN_GRACE;
-            while Instant::now() < grace {
-                match child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
-                    Ok(None) => std::thread::sleep(POLL),
-                }
-            }
-            Some(kill_err)
+) -> Vec<TeardownFailure> {
+    let mut failures = Vec::new();
+    if let Err(kill_err) = kill_group(child) {
+        failures.push(TeardownFailure::GroupKill(kill_err));
+        if let Err(kill_err) = child.kill() {
+            failures.push(TeardownFailure::ChildKill(kill_err));
         }
     }
+    if let Err(reap) = reap_bounded(|| child.try_wait(), TEARDOWN_GRACE) {
+        failures.push(TeardownFailure::Reap(reap));
+    }
+    failures
 }
 
 /// SIGKILLs the child's process group (pgid == child pid, per
@@ -535,6 +639,106 @@ mod tests {
         // 300ms timeout + at most the 1s reap grace; nowhere near the
         // child's own 30s lifetime.
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn reap_bounded_reports_grace_expiry_instead_of_hanging() {
+        // A child that never exits (injected `try_wait` always reports
+        // running): the bounded reap must give up and report, not hang
+        // like the old unbounded `Child::wait`.
+        let start = Instant::now();
+        let result = reap_bounded(|| Ok(None), Duration::from_millis(100));
+        assert!(
+            matches!(result, Err(ReapFailure::GraceExpired)),
+            "expected grace expiry, got {result:?}"
+        );
+        // ~100ms of polling, nowhere near an unbounded wait.
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn reap_bounded_reports_wait_errors() {
+        // A failing `try_wait` is surfaced as a reap failure, never
+        // silently treated as reaped.
+        let result = reap_bounded(
+            || Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            Duration::from_millis(100),
+        );
+        match result {
+            Err(ReapFailure::Wait(err)) => {
+                assert_eq!(err.raw_os_error(), Some(libc::EIO))
+            }
+            other => panic!("expected wait failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reap_bounded_reaps_a_killed_child() {
+        // The normal teardown case: a SIGKILLed child is reaped well
+        // within the grace.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let mut child = cmd.spawn().unwrap();
+        child.kill().unwrap();
+        reap_bounded(|| child.try_wait(), TEARDOWN_GRACE).unwrap();
+    }
+
+    #[test]
+    fn terminate_tree_after_successful_group_kill_is_clean() {
+        // Real group kill on our own process-group-leading child: the
+        // whole group is SIGKILLed and the direct child reaped within
+        // the grace, so the outcome is empty.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let failures = terminate_tree(&mut child, &kill_process_group);
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+    }
+
+    #[test]
+    fn terminate_tree_reports_group_kill_failure_and_reaps_direct_child() {
+        // Injected EPERM on the group kill: the outcome names the group
+        // kill failure, and the fallback still SIGKILLs and reaps the
+        // direct child (no zombie, no live `sleep 30`).
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let mut child = cmd.spawn().unwrap();
+        let failures = terminate_tree(&mut child, &|_| {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        assert_eq!(failures.len(), 1, "unexpected failures: {failures:?}");
+        assert!(matches!(failures[0], TeardownFailure::GroupKill(_)));
+        assert!(child.try_wait().unwrap().is_some(), "child not reaped");
+    }
+
+    #[test]
+    fn wait_error_path_retains_both_wait_and_teardown_failures() {
+        // A real `try_wait` failure is impractical to reproduce at the OS
+        // level, so the error-path teardown lives in `wait_failed` and is
+        // exercised here with a fabricated wait error plus an injected
+        // group-kill failure: the returned error must carry both, and
+        // teardown must still run (readers joined, child reaped).
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let readers = Readers::spawn(&mut child);
+        let err = wait_failed(
+            std::io::Error::from_raw_os_error(libc::EIO),
+            &mut child,
+            readers,
+            &|_| Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("waiting on child"), "wait error lost: {msg}");
+        assert!(
+            msg.contains("killing its process group failed"),
+            "teardown failure lost: {msg}"
+        );
+        // Teardown still happened: the fallback killed and reaped the
+        // child, and `wait_failed` joined the reader threads (they owned
+        // the taken pipes, so no thread outlives the call).
+        assert!(child.try_wait().unwrap().is_some(), "child not reaped");
     }
 
     #[test]
