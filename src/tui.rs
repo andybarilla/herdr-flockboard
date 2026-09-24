@@ -5,9 +5,7 @@
 //! keys and draws. Neither worker blocks the other, so a slow or hung `gh`
 //! shows up as older slot data, never as a stalled board.
 
-use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -37,18 +35,19 @@ const MAX_PRS_SHOWN: usize = 8;
 /// expired; short so a newly seen repo is fetched promptly.
 const GH_WORKER_TICK: Duration = Duration::from_secs(1);
 
-/// Slot cache shared between the agent worker (writes on sync, reads for
-/// snapshots) and the GitHub worker (writes fetch results).
-type SharedSlots = Arc<Mutex<HashMap<PathBuf, state::RepoSlot>>>;
+/// Slot cache shared between the agent worker (syncs it on each successful
+/// herdr poll, invalidates it on failure, reads it for snapshots) and the
+/// GitHub worker (writes fetch results back by ticket).
+type SharedSlots = Arc<Mutex<state::SlotCache>>;
 
-fn lock(slots: &SharedSlots) -> MutexGuard<'_, HashMap<PathBuf, state::RepoSlot>> {
+fn lock(slots: &SharedSlots) -> MutexGuard<'_, state::SlotCache> {
     // A poisoned lock means the other worker panicked mid-update; recover
     // the data rather than freeze the board.
     slots.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn run() -> Result<()> {
-    let slots: SharedSlots = Arc::new(Mutex::new(HashMap::new()));
+    let slots: SharedSlots = Arc::new(Mutex::new(state::SlotCache::default()));
     let (tx, rx) = mpsc::channel::<Dashboard>();
     std::thread::spawn({
         let slots = Arc::clone(&slots);
@@ -81,7 +80,11 @@ pub fn run() -> Result<()> {
 
 /// Polls `herdr` on the agent-poll cadence and publishes snapshots built
 /// from whatever the slot cache currently holds. Never calls `gh`, so the
-/// initial agent (or zero-agent) render is not gated on GitHub at all.
+/// initial agent (or zero-agent) render is not gated on GitHub at all. A
+/// failed poll invalidates the cache: without a live agent set there is no
+/// current repo set, so nothing stale stays eligible for GitHub work (and
+/// in-flight completions find no slot to land in); the error itself still
+/// renders, and the next successful poll repopulates from scratch.
 fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
     let herd = HerdCli::default();
     let mut remotes = RemoteCache::default();
@@ -92,8 +95,9 @@ fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
             .map(state::agent_rows);
         let dash = {
             let mut slots = lock(&slots);
-            if let Ok(rows) = &agents {
-                state::sync_slots(rows, &mut slots, &mut |cwd| remotes.get(cwd));
+            match &agents {
+                Ok(rows) => slots.sync(rows, &mut |cwd| remotes.get(cwd)),
+                Err(_) => slots.invalidate(),
             }
             state::dashboard(agents, &slots)
         };
@@ -105,20 +109,19 @@ fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
 }
 
 /// Refreshes due GitHub slots on its own cadence, independent of the agent
-/// poll. Snapshots the due list under the lock, fetches outside it (each
-/// `gh` call bounded by `GH_TIMEOUT`), then writes results back — errors
-/// included, so the board renders what the last fetch actually said. A
-/// slot pruned mid-fetch (its repo left the session) is simply dropped.
+/// poll. Snapshots the due list as tickets under the lock, fetches outside
+/// it (each `gh` call bounded by `GH_TIMEOUT`), then writes results back —
+/// errors included, so the board renders what the last fetch actually said.
+/// A ticket whose slot was pruned, re-created, or invalidated mid-fetch is
+/// stale: `record_fetch` rejects it by generation and repo identity.
 fn github_loop(slots: SharedSlots) {
     let gh = GhCli;
     loop {
-        let due = state::due_github_repos(&lock(&slots), Instant::now(), state::GH_TTL);
-        for (cwd, repo) in due {
-            let issues = gh.open_issues(&repo).map_err(|e| e.to_string());
-            let prs = gh.open_prs(&repo).map_err(|e| e.to_string());
-            if let Some(slot) = lock(&slots).get_mut(&cwd) {
-                state::record_fetch(slot, issues, prs, Instant::now());
-            }
+        let due = lock(&slots).due_github_repos(Instant::now(), state::GH_TTL);
+        for ticket in due {
+            let issues = gh.open_issues(&ticket.repo).map_err(|e| e.to_string());
+            let prs = gh.open_prs(&ticket.repo).map_err(|e| e.to_string());
+            lock(&slots).record_fetch(&ticket, issues, prs, Instant::now());
         }
         std::thread::sleep(GH_WORKER_TICK);
     }

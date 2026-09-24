@@ -3,7 +3,7 @@
 //! terminal — so agent grouping, label bucketing, PR classification, and the
 //! GitHub TTL cache are all unit-testable with fakes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -229,23 +229,50 @@ pub fn pr_rows(prs: &[PullRequest]) -> Vec<PrRow> {
     rows
 }
 
-/// Cached per-repo GitHub state. Created when an agent's cwd first names a
-/// repo and pruned when no live agent references it anymore; raw fetch
-/// results (including errors) are cached so a flaky `gh` is retried on the
-/// refresh TTL, not continuously.
+/// Identity of a cached repo slot. GitHub repos key by "owner/name" so
+/// several agent cwds/worktrees for the same repo share one cache entry,
+/// one `gh` fetch, and one rendered row with an aggregated agent count.
+/// Everything else keys by cwd: without a GitHub identity there is nothing
+/// stable to dedupe by, and distinct local paths must never collapse into
+/// one another just because their basenames match.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SlotKey {
+    GitHub(String),
+    Local(PathBuf),
+}
+
+impl SlotKey {
+    fn for_remote(cwd: &Path, remote: &Remote) -> Self {
+        match remote {
+            Remote::GitHub { repo, .. } => Self::GitHub(repo.clone()),
+            _ => Self::Local(cwd.to_path_buf()),
+        }
+    }
+}
+
+/// Cached per-repo GitHub state. Created when the live agent set first
+/// names a slot key and pruned when nothing live references it anymore;
+/// raw fetch results (including errors) are cached so a flaky `gh` is
+/// retried on the refresh TTL, not continuously. `generation` is bumped
+/// on every creation so a fetch that started against a since-pruned slot
+/// cannot write its result into the replacement.
 pub struct RepoSlot {
-    pub cwd: PathBuf,
     pub remote: Remote,
+    pub generation: u64,
+    /// Live agents whose cwd resolves to this slot, aggregated across every
+    /// worktree that shares the repo; refreshed on every successful sync.
+    pub agent_count: usize,
     pub issues: Option<Result<Vec<Issue>, String>>,
     pub prs: Option<Result<Vec<PullRequest>, String>>,
     pub fetched_at: Option<Instant>,
 }
 
 impl RepoSlot {
-    pub fn new(cwd: PathBuf, remote: Remote) -> Self {
+    fn new(remote: Remote, generation: u64, agent_count: usize) -> Self {
         Self {
-            cwd,
             remote,
+            generation,
+            agent_count,
             issues: None,
             prs: None,
             fetched_at: None,
@@ -253,58 +280,120 @@ impl RepoSlot {
     }
 }
 
-/// Registers a slot for every cwd the live agents named, resolving the
-/// remote through `lookup` (a `RemoteCache` in production) for new cwds
-/// only, and drops slots whose cwd no live agent named anymore — GitHub
-/// work and cache only ever track repos currently in use.
-pub fn sync_slots(
-    rows: &[AgentRow],
-    slots: &mut HashMap<PathBuf, RepoSlot>,
-    lookup: &mut dyn FnMut(&Path) -> Remote,
-) {
-    slots.retain(|cwd, _| rows.iter().any(|row| row.cwd == *cwd));
-    for row in rows {
-        slots
-            .entry(row.cwd.clone())
-            .or_insert_with(|| RepoSlot::new(row.cwd.clone(), lookup(&row.cwd)));
+/// A unit of due GitHub work: which slot to write back to, which repo to
+/// fetch, and the slot generation the fetch started against. The identity
+/// plus generation make a completion that lands after the slot was pruned
+/// and re-created — or after the whole cache was invalidated — recognizably
+/// stale, so an old result can never overwrite a current entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchTicket {
+    pub key: SlotKey,
+    /// "owner/name", as `gh --repo` expects it.
+    pub repo: String,
+    pub generation: u64,
+}
+
+/// The live repo cache shared between the agent worker (syncs on each
+/// successful herdr poll, invalidates on failure) and the GitHub worker
+/// (reads due tickets, writes results back). Iteration is ordered so the
+/// rendered board is deterministic. GitHub work and cache only ever track
+/// repos currently in use.
+#[derive(Default)]
+pub struct SlotCache {
+    slots: BTreeMap<SlotKey, RepoSlot>,
+    generation: u64,
+}
+
+impl SlotCache {
+    /// Reconciles the cache with the live agent set: resolves every live
+    /// cwd through `lookup` (a `RemoteCache` in production, so this is a
+    /// map hit after first sight), refreshes per-slot agent counts, prunes
+    /// slots nothing live references anymore, and creates slots for newly
+    /// seen keys with a fresh generation. A cwd whose remote lookup was
+    /// reclassified since the last poll maps to a different key, so its old
+    /// slot is pruned and the new one starts empty with a new generation —
+    /// an in-flight fetch for the old identity is rejected on writeback.
+    pub fn sync(&mut self, rows: &[AgentRow], lookup: &mut dyn FnMut(&Path) -> Remote) {
+        let mut live: BTreeMap<SlotKey, (Remote, usize)> = BTreeMap::new();
+        for row in rows {
+            let remote = lookup(&row.cwd);
+            let entry = live
+                .entry(SlotKey::for_remote(&row.cwd, &remote))
+                .or_insert_with(|| (remote, 0));
+            entry.1 += 1;
+        }
+        self.slots.retain(|key, _| live.contains_key(key));
+        for (key, (remote, count)) in live {
+            match self.slots.get_mut(&key) {
+                Some(slot) => slot.agent_count = count,
+                None => {
+                    self.generation += 1;
+                    self.slots
+                        .insert(key, RepoSlot::new(remote, self.generation, count));
+                }
+            }
+        }
     }
-}
 
-/// GitHub-hosted slots due for a refetch, as (cwd, "owner/repo") pairs the
-/// GitHub worker can fetch without holding the slots lock. Non-GitHub
-/// remotes are never listed — their inline state explains why — and a slot
-/// inside its TTL keeps its cached data, errors included, so a flaky `gh`
-/// is not retried on every agent poll.
-pub fn due_github_repos(
-    slots: &HashMap<PathBuf, RepoSlot>,
-    now: Instant,
-    ttl: Duration,
-) -> Vec<(PathBuf, String)> {
-    slots
-        .iter()
-        .filter_map(|(cwd, slot)| {
-            let Remote::GitHub { repo, .. } = &slot.remote else {
-                return None;
-            };
-            let due = slot
-                .fetched_at
-                .is_none_or(|at| now.duration_since(at) >= ttl);
-            due.then(|| (cwd.clone(), repo.clone()))
-        })
-        .collect()
-}
+    /// Drops every slot. Called when the herdr poll fails: without a live
+    /// agent set there is no current repo set, so nothing from the last
+    /// good poll may stay eligible for GitHub work, and completions of
+    /// fetches already in flight find no slot to land in. The dashboard
+    /// still renders the herdr error itself from the snapshot.
+    pub fn invalidate(&mut self) {
+        self.slots.clear();
+    }
 
-/// Stores a finished fetch — errors included — so the board shows what `gh`
-/// actually said rather than a spinner forever.
-pub fn record_fetch(
-    slot: &mut RepoSlot,
-    issues: Result<Vec<Issue>, String>,
-    prs: Result<Vec<PullRequest>, String>,
-    at: Instant,
-) {
-    slot.issues = Some(issues);
-    slot.prs = Some(prs);
-    slot.fetched_at = Some(at);
+    /// GitHub slots due for a refetch, as tickets the GitHub worker can
+    /// fetch without holding the lock. Non-GitHub slots are never listed —
+    /// their inline state explains why — and a slot inside its TTL keeps
+    /// its cached data, errors included, so a flaky `gh` is not retried on
+    /// every agent poll.
+    pub fn due_github_repos(&self, now: Instant, ttl: Duration) -> Vec<FetchTicket> {
+        self.slots
+            .iter()
+            .filter_map(|(key, slot)| {
+                let Remote::GitHub { repo, .. } = &slot.remote else {
+                    return None;
+                };
+                let due = slot
+                    .fetched_at
+                    .is_none_or(|at| now.duration_since(at) >= ttl);
+                due.then(|| FetchTicket {
+                    key: key.clone(),
+                    repo: repo.clone(),
+                    generation: slot.generation,
+                })
+            })
+            .collect()
+    }
+
+    /// Records a finished fetch — errors included — so the board shows what
+    /// `gh` actually said rather than a spinner forever. Returns false and
+    /// writes nothing when the ticket is stale: the slot is gone (pruned or
+    /// invalidated mid-fetch) or was re-created since the fetch started
+    /// (generation bumped or repo identity changed), because then the
+    /// result belongs to a repo set that no longer exists.
+    pub fn record_fetch(
+        &mut self,
+        ticket: &FetchTicket,
+        issues: Result<Vec<Issue>, String>,
+        prs: Result<Vec<PullRequest>, String>,
+        at: Instant,
+    ) -> bool {
+        let Some(slot) = self.slots.get_mut(&ticket.key) else {
+            return false;
+        };
+        let current = slot.generation == ticket.generation
+            && matches!(&slot.remote, Remote::GitHub { repo, .. } if *repo == ticket.repo);
+        if !current {
+            return false;
+        }
+        slot.issues = Some(issues);
+        slot.prs = Some(prs);
+        slot.fetched_at = Some(at);
+        true
+    }
 }
 
 /// What the board renders for one repo: identity, grouping, fetch state.
@@ -318,12 +407,15 @@ pub struct RepoView {
     pub fetched_at: Option<Instant>,
 }
 
-pub fn repo_view(slot: &RepoSlot, agent_count: usize) -> RepoView {
-    let dir = slot
-        .cwd
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| slot.cwd.display().to_string());
+pub fn repo_view(key: &SlotKey, slot: &RepoSlot) -> RepoView {
+    // Display name for local states, where no owner/repo identity exists.
+    let dir = match key {
+        SlotKey::Local(cwd) => cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cwd.display().to_string()),
+        SlotKey::GitHub(repo) => repo.clone(),
+    };
     let (key, org) = match &slot.remote {
         Remote::GitHub { org, repo } => (repo.clone(), org.clone()),
         Remote::NoOrigin | Remote::GitError(_) => (dir.clone(), NO_ORG_GROUP.to_string()),
@@ -341,7 +433,7 @@ pub fn repo_view(slot: &RepoSlot, agent_count: usize) -> RepoView {
         key,
         org,
         remote: slot.remote.clone(),
-        agent_count,
+        agent_count: slot.agent_count,
         issues,
         prs,
         fetched_at: slot.fetched_at,
@@ -375,19 +467,17 @@ pub fn group_repos(views: Vec<RepoView>) -> Vec<OrgGroup> {
     groups
 }
 
-/// The full board: agent rows (or the herdr error) plus repos discovered
-/// from live agent cwds, grouped by org. A herdr failure yields no repo
-/// section at all — without agents there is nothing to discover from — and
-/// the UI renders the error in place of the whole board.
+/// The full board: agent rows (or the herdr error) plus the live repo
+/// slots, grouped by org. A herdr failure yields no repo section at all —
+/// the agent worker invalidates the slot cache on error, and without
+/// agents there is nothing to discover from — and the UI renders the
+/// error in place of the whole board.
 pub struct Dashboard {
     pub agents: Result<Vec<AgentRow>, String>,
     pub groups: Vec<OrgGroup>,
 }
 
-pub fn dashboard(
-    agents: Result<Vec<AgentRow>, String>,
-    slots: &HashMap<PathBuf, RepoSlot>,
-) -> Dashboard {
+pub fn dashboard(agents: Result<Vec<AgentRow>, String>, cache: &SlotCache) -> Dashboard {
     let rows = match agents {
         Err(e) => {
             return Dashboard {
@@ -397,13 +487,10 @@ pub fn dashboard(
         }
         Ok(rows) => rows,
     };
-    let mut counts: HashMap<&Path, usize> = HashMap::new();
-    for row in &rows {
-        *counts.entry(row.cwd.as_path()).or_default() += 1;
-    }
-    let views: Vec<RepoView> = counts
+    let views: Vec<RepoView> = cache
+        .slots
         .iter()
-        .filter_map(|(cwd, n)| slots.get(*cwd).map(|slot| repo_view(slot, *n)))
+        .map(|(key, slot)| repo_view(key, slot))
         .collect();
     Dashboard {
         agents: Ok(rows),
@@ -444,14 +531,24 @@ mod tests {
         }
     }
 
-    fn github_slot(cwd: &str, repo: &str) -> RepoSlot {
-        RepoSlot::new(
-            PathBuf::from(cwd),
-            Remote::GitHub {
-                org: repo.split('/').next().unwrap().to_string(),
-                repo: repo.to_string(),
-            },
-        )
+    fn github_remote(repo: &str) -> Remote {
+        Remote::GitHub {
+            org: repo.split('/').next().unwrap().to_string(),
+            repo: repo.to_string(),
+        }
+    }
+
+    fn github_key(repo: &str) -> SlotKey {
+        SlotKey::GitHub(repo.to_string())
+    }
+
+    /// The single due ticket for `repo`, panicking unless there is exactly
+    /// one — which is itself the one-fetch-per-repo invariant.
+    fn due_ticket(cache: &SlotCache, repo: &str, now: Instant) -> FetchTicket {
+        let due = cache.due_github_repos(now, GH_TTL);
+        let matching: Vec<_> = due.iter().filter(|t| t.repo == repo).collect();
+        assert_eq!(matching.len(), 1, "exactly one due ticket for {repo}");
+        matching[0].clone()
     }
 
     #[test]
@@ -547,93 +644,191 @@ mod tests {
     }
 
     #[test]
-    fn sync_slots_registers_new_cwds_and_keeps_existing() {
+    fn sync_registers_new_cwds_and_keeps_fetch_state_across_polls() {
         let rows = agent_rows(vec![
             info("working", "/dev/a/one"),
             info("idle", "/dev/a/two"),
         ]);
-        let mut slots = HashMap::new();
-        let mut lookup = |_: &Path| Remote::NoOrigin;
-        sync_slots(&rows, &mut slots, &mut lookup);
-        assert_eq!(slots.len(), 2);
-        // A second sync must not re-resolve (the cache policy's job, but the
-        // entry guard is what makes re-resolution impossible here).
-        slots.get_mut(Path::new("/dev/a/one")).unwrap().remote = Remote::GitHub {
-            org: "o".to_string(),
-            repo: "o/one".to_string(),
+        let mut cache = SlotCache::default();
+        let mut lookup = |cwd: &Path| match cwd.to_str().unwrap() {
+            "/dev/a/one" => github_remote("o/one"),
+            _ => Remote::NoOrigin,
         };
-        sync_slots(&rows, &mut slots, &mut lookup);
-        assert!(matches!(
-            slots[Path::new("/dev/a/one")].remote,
-            Remote::GitHub { .. }
-        ));
+        cache.sync(&rows, &mut lookup);
+        assert_eq!(cache.slots.len(), 2);
+        let ticket = due_ticket(&cache, "o/one", Instant::now());
+        assert!(cache.record_fetch(&ticket, Ok(vec![]), Ok(vec![]), Instant::now()));
+        // Re-polling the same live set keeps the slot, its generation, and
+        // its cached fetch data; the count is simply refreshed.
+        cache.sync(&rows, &mut lookup);
+        let slot = &cache.slots[&github_key("o/one")];
+        assert_eq!(slot.generation, ticket.generation);
+        assert!(slot.fetched_at.is_some());
     }
 
     #[test]
-    fn sync_slots_prunes_repos_no_longer_live() {
-        let mut slots = HashMap::new();
-        let mut gone = github_slot("/dev/a/gone", "o/gone");
-        record_fetch(
-            &mut gone,
+    fn sync_prunes_repos_no_longer_live() {
+        let mut cache = SlotCache::default();
+        let mut lookup = |cwd: &Path| match cwd.to_str().unwrap() {
+            "/dev/a/gone" => github_remote("o/gone"),
+            _ => github_remote("o/kept"),
+        };
+        cache.sync(
+            &agent_rows(vec![
+                info("working", "/dev/a/gone"),
+                info("idle", "/dev/a/kept"),
+            ]),
+            &mut lookup,
+        );
+        assert!(cache.slots.contains_key(&github_key("o/gone")));
+        // Only /dev/a/kept is live now.
+        cache.sync(
+            &agent_rows(vec![info("working", "/dev/a/kept")]),
+            &mut lookup,
+        );
+        assert!(!cache.slots.contains_key(&github_key("o/gone")));
+        assert!(cache.slots.contains_key(&github_key("o/kept")));
+    }
+
+    #[test]
+    fn two_cwds_for_one_repo_share_one_slot_fetch_and_row() {
+        // A main checkout and a worktree of the same GitHub repo.
+        let rows = agent_rows(vec![
+            info("working", "/dev/a/repo"),
+            info("working", "/dev/wt/repo-feature"),
+            info("idle", "/dev/wt/repo-review"),
+        ]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("acme/repo");
+        cache.sync(&rows, &mut lookup);
+        assert_eq!(cache.slots.len(), 1, "one cache entry for the repo");
+        assert_eq!(cache.slots[&github_key("acme/repo")].agent_count, 3);
+        // Exactly one due fetch for the repo, not one per cwd.
+        let due = cache.due_github_repos(Instant::now(), GH_TTL);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].repo, "acme/repo");
+        // And exactly one rendered row, with the aggregated agent count.
+        let dash = dashboard(Ok(rows), &cache);
+        assert_eq!(dash.groups.len(), 1);
+        assert_eq!(dash.groups[0].repos.len(), 1);
+        let view = &dash.groups[0].repos[0];
+        assert_eq!(view.key, "acme/repo");
+        assert_eq!(view.agent_count, 3);
+    }
+
+    #[test]
+    fn invalidate_clears_live_set_and_rejects_in_flight_completions() {
+        let rows = agent_rows(vec![info("working", "/dev/a/one")]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(&rows, &mut lookup);
+        let ticket = due_ticket(&cache, "o/one", Instant::now());
+        // The herdr poll fails: the live repo set is invalidated.
+        cache.invalidate();
+        assert!(
+            cache.due_github_repos(Instant::now(), GH_TTL).is_empty(),
+            "no repo stays eligible for gh work"
+        );
+        // A fetch that was in flight when the poll failed has nowhere to land.
+        assert!(!cache.record_fetch(&ticket, Ok(vec![]), Ok(vec![]), Instant::now()));
+        // The dashboard renders the herdr error with no repo section.
+        let dash = dashboard(Err("server not running".to_string()), &cache);
+        assert_eq!(dash.agents.unwrap_err(), "server not running");
+        assert!(dash.groups.is_empty());
+        // The next successful poll re-populates and re-fetches from scratch.
+        cache.sync(&rows, &mut lookup);
+        assert_eq!(cache.due_github_repos(Instant::now(), GH_TTL).len(), 1);
+    }
+
+    #[test]
+    fn stale_ticket_after_remove_and_readd_is_rejected() {
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(
+            &agent_rows(vec![info("working", "/dev/a/one")]),
+            &mut lookup,
+        );
+        let old = due_ticket(&cache, "o/one", Instant::now());
+        // The repo leaves the session entirely...
+        cache.sync(&[], &mut lookup);
+        assert!(cache.slots.is_empty());
+        // ...then a different worktree brings the same repo back.
+        cache.sync(&agent_rows(vec![info("idle", "/dev/wt/one")]), &mut lookup);
+        // The old in-flight completion must not overwrite the new entry.
+        assert!(!cache.record_fetch(
+            &old,
             Ok(vec![issue(&["blocked"])]),
             Ok(vec![]),
-            Instant::now(),
-        );
-        slots.insert(PathBuf::from("/dev/a/gone"), gone);
-        slots.insert(
-            PathBuf::from("/dev/a/kept"),
-            github_slot("/dev/a/kept", "o/kept"),
-        );
-        // Only /dev/a/kept is live now.
-        let rows = agent_rows(vec![info("working", "/dev/a/kept")]);
-        let mut lookup = |_: &Path| Remote::NoOrigin;
-        sync_slots(&rows, &mut slots, &mut lookup);
-        assert!(!slots.contains_key(Path::new("/dev/a/gone")));
-        assert!(slots.contains_key(Path::new("/dev/a/kept")));
+            Instant::now()
+        ));
+        let slot = &cache.slots[&github_key("o/one")];
+        assert!(slot.issues.is_none(), "stale result was not recorded");
+        assert_ne!(slot.generation, old.generation);
+        // The new generation's own fetch is accepted.
+        let current = due_ticket(&cache, "o/one", Instant::now());
+        assert!(cache.record_fetch(&current, Ok(vec![]), Ok(vec![]), Instant::now()));
+        assert!(cache.slots[&github_key("o/one")].fetched_at.is_some());
+    }
+
+    #[test]
+    fn stale_ticket_after_reclassification_is_rejected() {
+        let remote = std::cell::RefCell::new(github_remote("o/before"));
+        let mut lookup = |_: &Path| remote.borrow().clone();
+        let rows = agent_rows(vec![info("working", "/dev/a/one")]);
+        let mut cache = SlotCache::default();
+        cache.sync(&rows, &mut lookup);
+        let old = due_ticket(&cache, "o/before", Instant::now());
+        // The cwd's origin now points at a different repo (RemoteCache TTL
+        // expired and git answered differently).
+        *remote.borrow_mut() = github_remote("o/after");
+        cache.sync(&rows, &mut lookup);
+        assert!(!cache.slots.contains_key(&github_key("o/before")));
+        assert!(cache.slots.contains_key(&github_key("o/after")));
+        assert!(!cache.record_fetch(&old, Ok(vec![]), Ok(vec![]), Instant::now()));
+        let due = cache.due_github_repos(Instant::now(), GH_TTL);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].repo, "o/after");
     }
 
     #[test]
     fn due_github_repos_selects_only_due_github_slots() {
         let now = Instant::now();
-        let mut slots = HashMap::new();
-        // Never fetched: due.
-        slots.insert(
-            PathBuf::from("/dev/a/new"),
-            github_slot("/dev/a/new", "o/new"),
-        );
-        // Non-GitHub: never due.
-        slots.insert(
-            PathBuf::from("/dev/a/plain"),
-            RepoSlot::new(PathBuf::from("/dev/a/plain"), Remote::NoOrigin),
-        );
-        // Fresh: inside the TTL, not due.
-        let mut fresh = github_slot("/dev/a/fresh", "o/fresh");
-        record_fetch(
-            &mut fresh,
+        let rows = agent_rows(vec![
+            info("working", "/dev/a/new"),
+            info("working", "/dev/a/plain"),
+            info("working", "/dev/a/fresh"),
+            info("working", "/dev/a/stale"),
+        ]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |cwd: &Path| match cwd.to_str().unwrap() {
+            "/dev/a/new" => github_remote("o/new"),
+            "/dev/a/fresh" => github_remote("o/fresh"),
+            "/dev/a/stale" => github_remote("o/stale"),
+            _ => Remote::NoOrigin, // never due
+        };
+        cache.sync(&rows, &mut lookup);
+        // Fresh: completed inside the TTL. Stale: completed past it.
+        let fresh = due_ticket(&cache, "o/fresh", now);
+        assert!(cache.record_fetch(
+            &fresh,
             Ok(vec![]),
             Ok(vec![]),
-            now - Duration::from_secs(10),
-        );
-        slots.insert(PathBuf::from("/dev/a/fresh"), fresh);
-        // Stale: past the TTL, due.
-        let mut stale = github_slot("/dev/a/stale", "o/stale");
-        record_fetch(
-            &mut stale,
+            now - Duration::from_secs(10)
+        ));
+        let stale = due_ticket(&cache, "o/stale", now);
+        assert!(cache.record_fetch(
+            &stale,
             Ok(vec![]),
             Ok(vec![]),
             now - GH_TTL - Duration::from_secs(1),
-        );
-        slots.insert(PathBuf::from("/dev/a/stale"), stale);
-
-        let mut due = due_github_repos(&slots, now, GH_TTL);
+        ));
+        let mut due: Vec<String> = cache
+            .due_github_repos(now, GH_TTL)
+            .into_iter()
+            .map(|t| t.repo)
+            .collect();
         due.sort();
-        assert_eq!(
-            due,
-            vec![
-                (PathBuf::from("/dev/a/new"), "o/new".to_string()),
-                (PathBuf::from("/dev/a/stale"), "o/stale".to_string()),
-            ]
-        );
+        assert_eq!(due, vec!["o/new".to_string(), "o/stale".to_string()]);
     }
 
     #[test]
@@ -642,11 +837,18 @@ mod tests {
             issues: Err("gh: auth required".to_string()),
             prs: Ok(vec![]),
         };
-        let mut slot = github_slot("/dev/a/one", "o/one");
-        let issues = gh.open_issues("o/one").map_err(|e| e.to_string());
-        let prs = gh.open_prs("o/one").map_err(|e| e.to_string());
-        record_fetch(&mut slot, issues, prs, Instant::now());
-        let view = repo_view(&slot, 1);
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(
+            &agent_rows(vec![info("working", "/dev/a/one")]),
+            &mut lookup,
+        );
+        let ticket = due_ticket(&cache, "o/one", Instant::now());
+        let issues = gh.open_issues(&ticket.repo).map_err(|e| e.to_string());
+        let prs = gh.open_prs(&ticket.repo).map_err(|e| e.to_string());
+        // A current-generation completion is accepted.
+        assert!(cache.record_fetch(&ticket, issues, prs, Instant::now()));
+        let view = repo_view(&ticket.key, &cache.slots[&ticket.key]);
         assert_eq!(view.issues, Some(Err("gh: auth required".to_string())));
         assert_eq!(view.prs, Some(Ok(vec![])));
         assert!(view.fetched_at.is_some());
@@ -660,20 +862,14 @@ mod tests {
             info("working", "/dev/a/beta"), // two agents share a repo
             info("working", "/dev/a/local"),
         ]);
-        let mut slots = HashMap::new();
-        slots.insert(
-            PathBuf::from("/dev/a/zeta"),
-            github_slot("/dev/a/zeta", "acme/zeta"),
-        );
-        slots.insert(
-            PathBuf::from("/dev/a/beta"),
-            github_slot("/dev/a/beta", "acme/beta"),
-        );
-        slots.insert(
-            PathBuf::from("/dev/a/local"),
-            RepoSlot::new(PathBuf::from("/dev/a/local"), Remote::NoOrigin),
-        );
-        let dash = dashboard(Ok(rows), &slots);
+        let mut cache = SlotCache::default();
+        let mut lookup = |cwd: &Path| match cwd.to_str().unwrap() {
+            "/dev/a/zeta" => github_remote("acme/zeta"),
+            "/dev/a/beta" => github_remote("acme/beta"),
+            _ => Remote::NoOrigin,
+        };
+        cache.sync(&rows, &mut lookup);
+        let dash = dashboard(Ok(rows), &cache);
         assert_eq!(dash.agents.unwrap().len(), 4);
         let orgs: Vec<&str> = dash.groups.iter().map(|g| g.org.as_str()).collect();
         assert_eq!(orgs, vec!["acme", NO_ORG_GROUP]);
@@ -685,20 +881,51 @@ mod tests {
     }
 
     #[test]
+    fn non_github_states_do_not_collapse_by_basename() {
+        // Distinct local paths with the same basename are unrelated repos
+        // and must each stay visible; git-error and non-GitHub states keep
+        // their own rows and grouping too.
+        let rows = agent_rows(vec![
+            info("working", "/dev/x/work"),
+            info("idle", "/dev/y/work"),
+            info("working", "/dev/z/broken"),
+            info("idle", "/dev/w/mirror"),
+        ]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |cwd: &Path| match cwd.to_str().unwrap() {
+            "/dev/z/broken" => Remote::GitError("not a repo".to_string()),
+            "/dev/w/mirror" => Remote::NonGitHub {
+                host: "gitlab.com".to_string(),
+            },
+            _ => Remote::NoOrigin,
+        };
+        cache.sync(&rows, &mut lookup);
+        assert_eq!(cache.slots.len(), 4, "no collapse by basename");
+        let dash = dashboard(Ok(rows), &cache);
+        let orgs: Vec<&str> = dash.groups.iter().map(|g| g.org.as_str()).collect();
+        assert_eq!(orgs, vec!["gitlab.com", NO_ORG_GROUP]);
+        let no_org = &dash.groups[1].repos;
+        let keys: Vec<&str> = no_org.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["broken", "work", "work"]);
+        assert_eq!(dash.groups[0].repos[0].key, "mirror (gitlab.com)");
+    }
+
+    #[test]
     fn dashboard_with_herdr_error_has_no_repo_section() {
-        let mut slots = HashMap::new();
-        slots.insert(
-            PathBuf::from("/dev/a/one"),
-            github_slot("/dev/a/one", "o/one"),
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(
+            &agent_rows(vec![info("working", "/dev/a/one")]),
+            &mut lookup,
         );
-        let dash = dashboard(Err("server not running".to_string()), &slots);
+        let dash = dashboard(Err("server not running".to_string()), &cache);
         assert_eq!(dash.agents.unwrap_err(), "server not running");
         assert!(dash.groups.is_empty());
     }
 
     #[test]
     fn dashboard_with_zero_agents_is_an_explicit_empty_state() {
-        let dash = dashboard(Ok(vec![]), &HashMap::new());
+        let dash = dashboard(Ok(vec![]), &SlotCache::default());
         assert!(dash.agents.unwrap().is_empty());
         assert!(dash.groups.is_empty());
     }

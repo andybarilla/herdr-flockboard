@@ -62,7 +62,10 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
   dedicated worker thread with a bounded per-command timeout, so a slow or
   hung `gh` never stalls the board.
 - Repo grouping: git origin organization, the same per-company grouping
-  `herdr-scuttlebutt` uses for its rooms.
+  `herdr-scuttlebutt` uses for its rooms. Multiple agent worktrees of the
+  same GitHub repo collapse into one row (one `gh` fetch per owner/repo,
+  agent counts aggregated), and a failed `herdr` poll clears the live repo
+  set — and with it any GitHub eligibility — until the poll recovers.
 - (Planned) Workflow stage per issue: the Flock event journal (`<repo>/.flock/events.jsonl`,
   see [flock#45](https://github.com/andybarilla/flock/issues/45)) plus inference
   from labels and PR state.
