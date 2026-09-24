@@ -29,6 +29,12 @@ pub struct PullRequest {
     /// Raw `reviewDecision` from gh: "", APPROVED, CHANGES_REQUESTED, or
     /// REVIEW_REQUIRED.
     pub review_decision: String,
+    /// Raw `mergeable` from gh: MERGEABLE, CONFLICTING, or UNKNOWN ("" when
+    /// gh did not report it).
+    pub mergeable: String,
+    /// Head branch name; correlates a PR back to its issue via the
+    /// `flock/issue-<n>-<slug>` branch pattern and journal `branch` fields.
+    pub head_ref_name: String,
     pub checks: Vec<CheckRollup>,
 }
 
@@ -72,6 +78,10 @@ struct RawPr {
     is_draft: bool,
     #[serde(default)]
     review_decision: String,
+    #[serde(default)]
+    mergeable: String,
+    #[serde(default)]
+    head_ref_name: String,
     // gh emits `null` (not `[]`) for a PR with no checks at all.
     #[serde(default)]
     status_check_rollup: Option<Vec<RawRollup>>,
@@ -108,6 +118,8 @@ pub fn parse_prs(json: &str) -> Result<Vec<PullRequest>> {
             title: r.title,
             draft: r.is_draft,
             review_decision: r.review_decision,
+            mergeable: r.mergeable,
+            head_ref_name: r.head_ref_name,
             checks: r
                 .status_check_rollup
                 .unwrap_or_default()
@@ -169,7 +181,7 @@ impl IssueTracker for GhCli {
             "--state",
             "open",
             "--json",
-            "number,title,isDraft,reviewDecision,statusCheckRollup",
+            "number,title,isDraft,reviewDecision,mergeable,headRefName,statusCheckRollup",
             "--limit",
             "200",
         ])?;
@@ -221,6 +233,7 @@ mod tests {
     fn parses_prs_with_both_check_shapes() {
         let json = r#"[
             {"number": 7, "title": "Fix", "isDraft": false, "reviewDecision": "APPROVED",
+             "mergeable": "MERGEABLE", "headRefName": "flock/issue-7-fix",
              "statusCheckRollup": [
                 {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "name": "test"},
                 {"__typename": "StatusContext", "state": "PENDING", "context": "ci"}
@@ -230,6 +243,8 @@ mod tests {
         let prs = parse_prs(json).unwrap();
         assert_eq!(prs.len(), 2);
         assert_eq!(prs[0].review_decision, "APPROVED");
+        assert_eq!(prs[0].mergeable, "MERGEABLE");
+        assert_eq!(prs[0].head_ref_name, "flock/issue-7-fix");
         assert_eq!(
             prs[0].checks,
             vec![

@@ -5,11 +5,13 @@ agent work: open issues by workflow state, which agents are running and where
 each issue is in its workflow, and what is waiting on the human — across every
 repo active in the herdr session.
 
-Status: **live status board**. The dashboard TUI shows every agent in the
+Status: **workflow stage board**. The dashboard TUI shows every agent in the
 herdr session with its status, plus per-repo open issues by Flock state label
-and open PRs with check/review state, grouped by git-origin organization.
-Read-only; per-issue workflow stage and the waiting-on-me inbox are still
-roadmap items (below).
+— each with its derived workflow stage (dispatched, pr open, checks pending/
+failing, mergeable, review clean/blocking, rework in progress, awaiting
+merge, merged, done, stopped, or died-mid-run unknown) — and open PRs with
+check/review state, grouped by git-origin organization. Read-only; the
+waiting-on-me inbox is still a roadmap item (below).
 
 ## Install
 
@@ -69,15 +71,27 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
   Repos without a usable GitHub origin (no origin, another host, or a
   broken/missing cwd) are keyed and rendered by full working-directory
   path, so same-named directories in different locations stay distinct.
-- (Planned) Workflow stage per issue: the Flock event journal (`<repo>/.flock/events.jsonl`,
-  see [flock#45](https://github.com/andybarilla/flock/issues/45)) plus inference
-  from labels and PR state.
+- Workflow stage per issue: the Flock event journal (`<repo>/.flock/events.jsonl`,
+  see [flock#45](https://github.com/andybarilla/flock/issues/45)) read from the
+  repo's live checkouts on every agent poll, correlated with PR
+  checks/mergeability (using the project-config green classifier:
+  SKIPPED/NEUTRAL satisfied, unknown fail-closed) and herdr agent liveness.
+  The reader is tolerant — a missing, truncated, corrupted (non-UTF-8), or
+  forward-versioned journal
+  degrades to label/PR-inferred stages rather than blanking the board — and a
+  run with no terminal event whose supervising agent is gone shows as
+  `unknown (run may have died)`. So that died-mid-run state stays visible
+  even when the dead agent was the repo's only one, a repo row is retained
+  for a bounded 120s grace period after its last agent disappears (rendered
+  with zero agents) before being pruned; a terminal journal event
+  (`issue_closed`/`run_stopped`) supersedes the died heuristic as soon as a
+  supervisor writes it.
 
 ## Roadmap
 
 1. ~~Scaffold: Cargo project, plugin manifest, build/install/link scripts, CI.~~
 2. ~~Live status board: agents + per-repo issues/PRs, read-only.~~
-3. Per-issue workflow stage view (reads the Flock event journal).
+3. ~~Per-issue workflow stage view (reads the Flock event journal).~~
 4. "Waiting on me" inbox: blocking reviews, parked PRs, stopped runs,
    needs-info items.
 5. Cross-repo activity feed (scuttlebutt-style).

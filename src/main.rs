@@ -1,7 +1,8 @@
 //! flockboard — a herdr plugin that shows a live dashboard of Flock-managed
 //! agent work: every agent in the herdr session with its status, and per-repo
-//! open issues by Flock state label and open PRs, grouped by git-origin
-//! organization. Read-only.
+//! open issues by Flock state label and workflow stage (derived from the
+//! Flock event journal) plus open PRs, grouped by git-origin organization.
+//! Read-only.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -9,6 +10,7 @@ use clap::{Parser, Subcommand};
 mod git_org;
 mod github;
 mod herd;
+mod journal;
 mod proc;
 mod state;
 mod tui;

@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::git_org::{Remote, RemoteCache};
 use crate::github::{GhCli, IssueTracker};
 use crate::herd::{HerdCli, HerdControl};
+use crate::journal::{self, Stage};
 use crate::state::{self, AgentStatus, Checks, Dashboard, RepoView, Review, LABEL_PRIORITY};
 
 /// How long the UI waits for a key before redrawing; also the cadence that
@@ -30,6 +31,9 @@ const UI_TICK: Duration = Duration::from_millis(250);
 
 /// PRs shown per repo before collapsing the tail into "+N more".
 const MAX_PRS_SHOWN: usize = 8;
+
+/// Issue rows shown per repo before collapsing the tail into "+N more".
+const MAX_ISSUES_SHOWN: usize = 8;
 
 /// How often the GitHub worker checks the slot cache for repos whose TTL
 /// expired; short so a newly seen repo is fetched promptly.
@@ -80,11 +84,14 @@ pub fn run() -> Result<()> {
 
 /// Polls `herdr` on the agent-poll cadence and publishes snapshots built
 /// from whatever the slot cache currently holds. Never calls `gh`, so the
-/// initial agent (or zero-agent) render is not gated on GitHub at all. A
-/// failed poll invalidates the cache: without a live agent set there is no
+/// initial agent (or zero-agent) render is not gated on GitHub at all; the
+/// per-repo Flock journals it re-reads after each sync are small local
+/// files with a tolerant parser. A failed poll invalidates the cache: without a live agent set there is no
 /// current repo set, so nothing stale stays eligible for GitHub work (and
 /// in-flight completions find no slot to land in); the error itself still
-/// renders, and the next successful poll repopulates from scratch.
+/// renders, and the next successful poll repopulates from scratch. A repo
+/// whose agents all disappeared is retained for `state::GONE_GRACE` so a
+/// died-mid-run issue stays visibly distinct before the row drops.
 fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
     let herd = HerdCli::default();
     let mut remotes = RemoteCache::default();
@@ -96,7 +103,12 @@ fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
         let dash = {
             let mut slots = lock(&slots);
             match &agents {
-                Ok(rows) => slots.sync(rows, &mut |cwd| remotes.get(cwd)),
+                Ok(rows) => {
+                    slots.sync(rows, &mut |cwd| remotes.get(cwd), Instant::now());
+                    // Journals are tiny and the reader is tolerant, so a
+                    // fresh read each poll keeps issue stages current.
+                    slots.refresh_journals(&journal::read_repo_events);
+                }
                 Err(_) => slots.invalidate(),
             }
             state::dashboard(agents, &slots)
@@ -288,6 +300,28 @@ fn render_issues(repo: &RepoView, lines: &mut Vec<Line<'static>>) {
         }
     };
     lines.push(line);
+    // Per-issue rows carry the Flock workflow stage derived from the repo's
+    // event journal, labels, and PR state. Rows follow the issue fetch
+    // state: nothing renders until the first fetch, and a gh error shows
+    // only on the summary line above.
+    if let Some(Ok(rows)) = &repo.issue_rows {
+        for row in rows.iter().take(MAX_ISSUES_SHOWN) {
+            lines.push(Line::from(vec![
+                Span::raw(format!("      #{:<5}", row.number)),
+                stage_span(&row.stage),
+                Span::styled(
+                    format!(" {}", truncate(&row.title, 60)),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+        }
+        if rows.len() > MAX_ISSUES_SHOWN {
+            lines.push(Line::from(Span::styled(
+                format!("      +{} more", rows.len() - MAX_ISSUES_SHOWN),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
 }
 
 fn render_prs(repo: &RepoView, lines: &mut Vec<Line<'static>>) {
@@ -329,6 +363,25 @@ fn render_prs(repo: &RepoView, lines: &mut Vec<Line<'static>>) {
             }
         }
     }
+}
+
+/// Stage colors: in-flight work cyan, waiting yellow, attention red,
+/// forward-ready green, done blue, dormant gray. A died-mid-run issue is
+/// magenta so it reads as neither live work nor a clean stop.
+fn stage_span(stage: &Stage) -> Span<'static> {
+    let color = match stage {
+        Stage::ReworkInProgress | Stage::Dispatched => Color::Cyan,
+        Stage::PrOpen | Stage::ChecksPending => Color::Yellow,
+        Stage::ChecksFailing | Stage::ReviewBlocking | Stage::Stopped(_) => Color::Red,
+        Stage::Died => Color::Magenta,
+        Stage::Mergeable | Stage::ReviewClean | Stage::AwaitingMerge | Stage::Merged => {
+            Color::Green
+        }
+        Stage::Done => Color::Blue,
+        Stage::Queued | Stage::Label(_) | Stage::None => Color::DarkGray,
+    };
+    let label = truncate(&stage.label(), 40);
+    Span::styled(format!(" {label:<40}"), Style::default().fg(color))
 }
 
 fn status_span(status: AgentStatus) -> Span<'static> {
@@ -459,6 +512,7 @@ mod tests {
             },
             agent_count: 1,
             issues,
+            issue_rows: None,
             prs,
             fetched_at,
         }
@@ -542,6 +596,61 @@ mod tests {
         assert!(staleness_lines(&lines).is_empty());
         let all: String = lines.iter().map(line_text).collect();
         assert!(all.contains("issues: fetching"));
+    }
+
+    #[test]
+    fn issue_rows_render_with_stage_labels() {
+        let mut repo = github_repo(
+            Some(Ok(IssueBuckets {
+                total: 2,
+                ..Default::default()
+            })),
+            Some(Ok(vec![])),
+            Some(Instant::now()),
+        );
+        repo.issue_rows = Some(Ok(vec![
+            crate::state::IssueRow {
+                number: 2,
+                title: "Workflow stage".to_string(),
+                stage: Stage::ReworkInProgress,
+            },
+            crate::state::IssueRow {
+                number: 3,
+                title: "Queued thing".to_string(),
+                stage: Stage::Queued,
+            },
+        ]));
+        let mut lines = Vec::new();
+        render_repo(&repo, &mut lines);
+        let all: Vec<String> = lines.iter().map(line_text).collect();
+        let row2 = all.iter().find(|t| t.contains("#2")).expect("issue 2 row");
+        assert!(row2.contains("rework in progress"));
+        let row3 = all.iter().find(|t| t.contains("#3")).expect("issue 3 row");
+        assert!(row3.contains("queued"));
+    }
+
+    #[test]
+    fn issue_row_tail_collapses_beyond_cap() {
+        let mut repo = github_repo(
+            Some(Ok(IssueBuckets {
+                total: MAX_ISSUES_SHOWN + 2,
+                ..Default::default()
+            })),
+            Some(Ok(vec![])),
+            Some(Instant::now()),
+        );
+        repo.issue_rows = Some(Ok((1..=(MAX_ISSUES_SHOWN + 2) as u64)
+            .map(|n| crate::state::IssueRow {
+                number: n,
+                title: "t".to_string(),
+                stage: Stage::None,
+            })
+            .collect()));
+        let mut lines = Vec::new();
+        render_repo(&repo, &mut lines);
+        let all: String = lines.iter().map(line_text).collect();
+        assert!(all.contains("+2 more"));
+        assert!(!all.contains(&format!("#{}", MAX_ISSUES_SHOWN + 2)));
     }
 
     #[test]
