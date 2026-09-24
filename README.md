@@ -5,8 +5,11 @@ agent work: open issues by workflow state, which agents are running and where
 each issue is in its workflow, and what is waiting on the human — across every
 repo active in the herdr session.
 
-Status: **scaffold**. The plugin installs, links its entrypoint, and opens its
-pane, but the dashboard TUI is a stub. See the roadmap below.
+Status: **live status board**. The dashboard TUI shows every agent in the
+herdr session with its status, plus per-repo open issues by Flock state label
+and open PRs with check/review state, grouped by git-origin organization.
+Read-only; per-issue workflow stage and the waiting-on-me inbox are still
+roadmap items (below).
 
 ## Install
 
@@ -52,21 +55,21 @@ rebuild it instead; `plugin install` refuses to replace a local link.
 
 The plugin exposes actions for opening the dashboard pane in a split or a tab.
 
-## Data sources (planned)
+## Data sources
 
-- Live agents, statuses, panes, and worktrees: the herdr socket API
-  (`herdr agent list` / snapshot).
-- Issues and PRs per repo: `gh`, cached with a short TTL.
-- Workflow stage per issue: the Flock event journal (`<repo>/.flock/events.jsonl`,
-  see [flock#45](https://github.com/andybarilla/flock/issues/45)) plus inference
-  from labels and PR state.
+- Live agents, statuses, panes, and cwds: `herdr agent list`, polled every 3s.
+- Issues and PRs per repo: `gh`, cached with a 45s TTL and refreshed off the
+  UI path so the board never blocks on GitHub.
 - Repo grouping: git origin organization, the same per-company grouping
   `herdr-scuttlebutt` uses for its rooms.
+- (Planned) Workflow stage per issue: the Flock event journal (`<repo>/.flock/events.jsonl`,
+  see [flock#45](https://github.com/andybarilla/flock/issues/45)) plus inference
+  from labels and PR state.
 
 ## Roadmap
 
-1. Scaffold: Cargo project, plugin manifest, build/install/link scripts, CI.
-2. Live status board: agents + per-repo issues/PRs, read-only.
+1. ~~Scaffold: Cargo project, plugin manifest, build/install/link scripts, CI.~~
+2. ~~Live status board: agents + per-repo issues/PRs, read-only.~~
 3. Per-issue workflow stage view (reads the Flock event journal).
 4. "Waiting on me" inbox: blocking reviews, parked PRs, stopped runs,
    needs-info items.

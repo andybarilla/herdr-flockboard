@@ -1,11 +1,16 @@
 //! flockboard — a herdr plugin that shows a live dashboard of Flock-managed
-//! agent work: issues by workflow state, running agents and their stage, and
-//! what is waiting on the human.
-//!
-//! Scaffold only for now — the `tui` command is a stub. See ROADMAP.
+//! agent work: every agent in the herdr session with its status, and per-repo
+//! open issues by Flock state label and open PRs, grouped by git-origin
+//! organization. Read-only.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+mod git_org;
+mod github;
+mod herd;
+mod state;
+mod tui;
 
 #[derive(Parser)]
 #[command(
@@ -27,9 +32,6 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Tui => {
-            eprintln!("flockboard: dashboard TUI not implemented yet (scaffold build).");
-            std::process::exit(1);
-        }
+        Commands::Tui => tui::run(),
     }
 }
