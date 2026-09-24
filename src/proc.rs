@@ -472,51 +472,21 @@ mod tests {
         assert_eq!(String::from_utf8(out.stderr).unwrap().trim(), "oops");
     }
 
-    /// Restores the process's original fd 0 on drop, so the
-    /// stdin-swapping regression test cannot leak its temporary stdin
-    /// into the rest of the test process even when an assertion panics.
-    struct StdinGuard {
-        saved: std::os::unix::io::RawFd,
-    }
-
-    impl StdinGuard {
-        /// Points this process's fd 0 at `file` until the guard drops.
-        fn replace(file: &std::fs::File) -> Self {
-            // SAFETY: dup/dup2 on valid open fds; a failure would corrupt
-            // the whole test process if ignored, so it aborts the test.
-            let saved = unsafe { libc::dup(0) };
-            assert!(saved >= 0, "dup(stdin) failed");
-            let rc = unsafe { libc::dup2(file.as_raw_fd(), 0) };
-            assert!(rc >= 0, "dup2(file, stdin) failed");
-            Self { saved }
-        }
-    }
-
-    impl Drop for StdinGuard {
-        fn drop(&mut self) {
-            // SAFETY: restoring a valid saved fd over fd 0, then closing
-            // the duplicate.
-            unsafe {
-                libc::dup2(self.saved, 0);
-                libc::close(self.saved);
-            }
-        }
-    }
-
     #[test]
     fn child_stdin_is_dev_null_never_inherited() {
         // Regression for the TUI review finding: a child inheriting fd 0
         // could consume dashboard keypresses or block on interactive
-        // input. Deterministic on ANY harness stdin — including a live
-        // terminal, which this test must never read — by pointing this
-        // process's own fd 0 at a sentinel file for the spawn: an
-        // inherited stdin is then visibly different from /dev/null (the
-        // `-ef` check) and yields the sentinel bytes (the `cat` check),
-        // while a null stdin gives the child immediate EOF. The sentinel
-        // is a regular file, so even a regressed child reads it and
-        // exits promptly — the test can never block on a terminal. fd 0
-        // is process-global, but the swap only spans the run and no other
-        // test reads stdin; the guard restores fd 0 even on panic.
+        // input. The sentinel file is wired as this command's stdin — if
+        // `run_with_timeout` ever failed to override it with
+        // `Stdio::null()`, the child would see that sentinel instead:
+        // the `-ef` check distinguishes it from /dev/null and the `cat`
+        // check reads the sentinel bytes, while a null stdin gives
+        // immediate EOF. This is per-command state only — no
+        // process-global fd or env mutation — so it cannot race with
+        // other tests running in parallel, and it is deterministic on
+        // ANY harness stdin, including a live terminal this test never
+        // reads: even a regressed child reads a regular file and exits
+        // promptly, so the test can never block.
         let dir = std::env::temp_dir().join(format!(
             "flockboard-proc-stdin-{}-{}",
             std::process::id(),
@@ -533,15 +503,15 @@ mod tests {
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg("[ /dev/stdin -ef /dev/null ] || exit 42; [ -z \"$(cat)\" ] || exit 43");
+            .arg("[ /dev/stdin -ef /dev/null ] || exit 42; [ -z \"$(cat)\" ] || exit 43")
+            // Would be the child's stdin if the runner did not override
+            // it; the runner must replace this with /dev/null.
+            .stdin(Stdio::from(file));
         let start = Instant::now();
-        let out = {
-            let _guard = StdinGuard::replace(&file);
-            run_with_timeout(&mut cmd, Duration::from_secs(5)).unwrap()
-        };
+        let out = run_with_timeout(&mut cmd, Duration::from_secs(5)).unwrap();
         assert!(
             out.status.success(),
-            "child stdin was inherited or not at EOF: {out:?}"
+            "child stdin was not overridden with /dev/null: {out:?}"
         );
         // EOF is immediate; nowhere near the 5s timeout a blocked read
         // would hit.
