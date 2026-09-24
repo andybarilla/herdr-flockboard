@@ -89,7 +89,9 @@ pub fn run() -> Result<()> {
 /// files with a tolerant parser. A failed poll invalidates the cache: without a live agent set there is no
 /// current repo set, so nothing stale stays eligible for GitHub work (and
 /// in-flight completions find no slot to land in); the error itself still
-/// renders, and the next successful poll repopulates from scratch.
+/// renders, and the next successful poll repopulates from scratch. A repo
+/// whose agents all disappeared is retained for `state::GONE_GRACE` so a
+/// died-mid-run issue stays visibly distinct before the row drops.
 fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
     let herd = HerdCli::default();
     let mut remotes = RemoteCache::default();
@@ -102,7 +104,7 @@ fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
             let mut slots = lock(&slots);
             match &agents {
                 Ok(rows) => {
-                    slots.sync(rows, &mut |cwd| remotes.get(cwd));
+                    slots.sync(rows, &mut |cwd| remotes.get(cwd), Instant::now());
                     // Journals are tiny and the reader is tolerant, so a
                     // fresh read each poll keeps issue stages current.
                     slots.refresh_journals(&journal::read_repo_events);
@@ -372,7 +374,9 @@ fn stage_span(stage: &Stage) -> Span<'static> {
         Stage::PrOpen | Stage::ChecksPending => Color::Yellow,
         Stage::ChecksFailing | Stage::ReviewBlocking | Stage::Stopped(_) => Color::Red,
         Stage::Died => Color::Magenta,
-        Stage::Mergeable | Stage::ReviewClean | Stage::AwaitingMerge => Color::Green,
+        Stage::Mergeable | Stage::ReviewClean | Stage::AwaitingMerge | Stage::Merged => {
+            Color::Green
+        }
         Stage::Done => Color::Blue,
         Stage::Queued | Stage::Label(_) | Stage::None => Color::DarkGray,
     };

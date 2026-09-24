@@ -22,6 +22,14 @@ pub const AGENT_POLL: Duration = Duration::from_secs(3);
 /// that a busy session does not hammer `gh`.
 pub const GH_TTL: Duration = Duration::from_secs(45);
 
+/// How long a repo slot is retained after its last live agent disappears.
+/// A died sole agent must not take the repo's row — and with it the
+/// `unknown (run may have died)` stage — off the board immediately, so a
+/// freshly departed slot keeps its journal, cwds, and cached GitHub data
+/// (rendered with zero live agents) until this bounded grace period
+/// elapses or a terminal event supersedes the died heuristic.
+pub const GONE_GRACE: Duration = Duration::from_secs(120);
+
 /// Tracked Flock state labels, most-urgent first. An issue carrying several
 /// tracked labels lands in the first matching bucket so the board counts each
 /// issue exactly once, and the bucket that needs the human soonest wins.
@@ -254,8 +262,10 @@ impl SlotKey {
 }
 
 /// Cached per-repo GitHub state. Created when the live agent set first
-/// names a slot key and pruned when nothing live references it anymore;
-/// raw fetch results (including errors) are cached so a flaky `gh` is
+/// names a slot key and pruned when nothing live has referenced it for
+/// longer than `GONE_GRACE` (a died sole agent leaves the repo on the
+/// board briefly so its died-mid-run stage can render); raw fetch results
+/// (including errors) are cached so a flaky `gh` is
 /// retried on the refresh TTL, not continuously. `generation` is bumped
 /// on every creation or reclassification so a fetch that started against
 /// a since-pruned or reclassified slot cannot write its result into the
@@ -265,11 +275,17 @@ pub struct RepoSlot {
     pub generation: u64,
     /// Live agents whose cwd resolves to this slot, aggregated across every
     /// worktree that shares the repo; refreshed on every successful sync.
+    /// Zero on a retained slot whose agents have all disappeared.
     pub agent_count: usize,
     /// Every live cwd that resolves to this slot (main checkout plus any
     /// worktrees), sorted for deterministic journal reads. The Flock
-    /// journal lives in whichever checkout a supervisor ran in.
+    /// journal lives in whichever checkout a supervisor ran in. Kept from
+    /// the last live sync on a retained slot, so its journal stays
+    /// readable through the grace period.
     pub cwds: BTreeSet<PathBuf>,
+    /// When the slot was first seen with no live agents, if it is
+    /// currently in the `GONE_GRACE` retention window.
+    pub gone_since: Option<Instant>,
     /// The repo's parsed Flock journal, re-read after each successful sync.
     /// Empty when no live checkout has a readable journal.
     pub journal: Arc<Vec<journal::Event>>,
@@ -285,6 +301,7 @@ impl RepoSlot {
             generation,
             agent_count,
             cwds,
+            gone_since: None,
             journal: Arc::new(Vec::new()),
             issues: None,
             prs: None,
@@ -309,8 +326,8 @@ pub struct FetchTicket {
 /// The live repo cache shared between the agent worker (syncs on each
 /// successful herdr poll, invalidates on failure) and the GitHub worker
 /// (reads due tickets, writes results back). Iteration is ordered so the
-/// rendered board is deterministic. GitHub work and cache only ever track
-/// repos currently in use.
+/// rendered board is deterministic. GitHub work and cache track repos in
+/// use plus recently departed ones inside the `GONE_GRACE` window.
 #[derive(Default)]
 pub struct SlotCache {
     slots: BTreeMap<SlotKey, RepoSlot>,
@@ -321,17 +338,29 @@ impl SlotCache {
     /// Reconciles the cache with the live agent set: resolves every live
     /// cwd through `lookup` (a `RemoteCache` in production, so this is a
     /// map hit after first sight), refreshes per-slot agent counts and cwd
-    /// sets, prunes slots nothing live references anymore, and creates
-    /// slots for newly seen keys with a fresh generation. A cwd reclassified to or from a
-    /// GitHub identity maps to a different key, so its old slot is pruned
-    /// and the new one starts empty with a new generation — an in-flight
-    /// fetch for the old identity is rejected on writeback. A local cwd
+    /// sets, and creates slots for newly seen keys with a fresh
+    /// generation. Slots nothing live references anymore are not pruned
+    /// immediately: they enter the `GONE_GRACE` retention window (agent
+    /// count zeroed, journal/cwds/fetch state kept) so a repo whose sole
+    /// supervising agent just died still renders — including its
+    /// died-mid-run issue stages — and only once the grace period has
+    /// elapsed are they pruned. A cwd reclassified to or from a
+    /// GitHub identity maps to a different key; its cwds are still live,
+    /// so its old slot is pruned immediately (no retention) and the new
+    /// one starts empty with a new generation — an in-flight fetch for
+    /// the old identity is rejected on writeback. A local cwd
     /// that keeps its key but moves among NoOrigin/NonGitHub/GitError is
     /// reclassified in place: the slot is replaced wholesale (fresh
     /// generation, no cached state) so nothing from the old
     /// classification survives.
-    pub fn sync(&mut self, rows: &[AgentRow], lookup: &mut dyn FnMut(&Path) -> Remote) {
+    pub fn sync(
+        &mut self,
+        rows: &[AgentRow],
+        lookup: &mut dyn FnMut(&Path) -> Remote,
+        now: Instant,
+    ) {
         let mut live: BTreeMap<SlotKey, (Remote, usize, BTreeSet<PathBuf>)> = BTreeMap::new();
+        let mut live_cwds: BTreeSet<PathBuf> = BTreeSet::new();
         for row in rows {
             let remote = lookup(&row.cwd);
             let entry = live
@@ -339,13 +368,34 @@ impl SlotCache {
                 .or_insert_with(|| (remote, 0, BTreeSet::new()));
             entry.1 += 1;
             entry.2.insert(row.cwd.clone());
+            live_cwds.insert(row.cwd.clone());
         }
-        self.slots.retain(|key, _| live.contains_key(key));
+        // Departed slots enter the grace window on first absence and are
+        // pruned only once it has fully elapsed. A slot whose cwds are all
+        // still live under a different key was reclassified, not
+        // abandoned, and is pruned immediately.
+        self.slots.retain(|key, slot| {
+            if live.contains_key(key) {
+                return true;
+            }
+            if slot.cwds.iter().any(|cwd| live_cwds.contains(cwd)) {
+                return false;
+            }
+            match slot.gone_since {
+                None => {
+                    slot.gone_since = Some(now);
+                    slot.agent_count = 0;
+                    true
+                }
+                Some(since) => now.duration_since(since) < GONE_GRACE,
+            }
+        });
         for (key, (remote, count, cwds)) in live {
             match self.slots.get_mut(&key) {
                 Some(slot) if slot.remote == remote => {
                     slot.agent_count = count;
                     slot.cwds = cwds;
+                    slot.gone_since = None;
                 }
                 Some(slot) => {
                     self.generation += 1;
@@ -360,7 +410,8 @@ impl SlotCache {
         }
     }
 
-    /// Drops every slot. Called when the herdr poll fails: without a live
+    /// Drops every slot, retained ones included. Called when the herdr
+    /// poll fails: without a live
     /// agent set there is no current repo set, so nothing from the last
     /// good poll may stay eligible for GitHub work, and completions of
     /// fetches already in flight find no slot to land in. The dashboard
@@ -373,8 +424,10 @@ impl SlotCache {
     /// Called after each successful sync: journals are small and the reader
     /// is tolerant (missing file, truncated tail, unknown events), so a
     /// fresh read per agent poll keeps stages current without a second
-    /// cache/TTL layer. Non-GitHub slots have no issue/PR surface and are
-    /// skipped.
+    /// cache/TTL layer. Retained (grace-window) slots keep reading from
+    /// their last live checkouts, so a died run's terminal event is picked
+    /// up as soon as a supervisor writes it. Non-GitHub slots have no
+    /// issue/PR surface and are skipped.
     pub fn refresh_journals(&mut self, reader: &dyn Fn(&BTreeSet<PathBuf>) -> Vec<journal::Event>) {
         for slot in self.slots.values_mut() {
             if matches!(slot.remote, Remote::GitHub { .. }) {
@@ -791,20 +844,21 @@ mod tests {
             "/dev/a/one" => github_remote("o/one"),
             _ => Remote::NoOrigin,
         };
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         assert_eq!(cache.slots.len(), 2);
         let ticket = due_ticket(&cache, "o/one", Instant::now());
         assert!(cache.record_fetch(&ticket, Ok(vec![]), Ok(vec![]), Instant::now()));
         // Re-polling the same live set keeps the slot, its generation, and
         // its cached fetch data; the count is simply refreshed.
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         let slot = &cache.slots[&github_key("o/one")];
         assert_eq!(slot.generation, ticket.generation);
         assert!(slot.fetched_at.is_some());
     }
 
     #[test]
-    fn sync_prunes_repos_no_longer_live() {
+    fn sync_retains_recently_gone_repos_then_prunes_after_grace() {
+        let t0 = Instant::now();
         let mut cache = SlotCache::default();
         let mut lookup = |cwd: &Path| match cwd.to_str().unwrap() {
             "/dev/a/gone" => github_remote("o/gone"),
@@ -816,15 +870,71 @@ mod tests {
                 info("idle", "/dev/a/kept"),
             ]),
             &mut lookup,
+            t0,
         );
         assert!(cache.slots.contains_key(&github_key("o/gone")));
-        // Only /dev/a/kept is live now.
+        // Only /dev/a/kept is live now: o/gone enters the grace window —
+        // kept (so a died run stays visible) but with zero live agents.
         cache.sync(
             &agent_rows(vec![info("working", "/dev/a/kept")]),
             &mut lookup,
+            t0 + Duration::from_secs(3),
+        );
+        let gone = &cache.slots[&github_key("o/gone")];
+        assert_eq!(gone.agent_count, 0);
+        assert!(gone.gone_since.is_some());
+        assert!(cache.slots.contains_key(&github_key("o/kept")));
+        // Once the grace period has fully elapsed the slot is pruned.
+        cache.sync(
+            &agent_rows(vec![info("working", "/dev/a/kept")]),
+            &mut lookup,
+            t0 + Duration::from_secs(3) + GONE_GRACE + Duration::from_secs(1),
         );
         assert!(!cache.slots.contains_key(&github_key("o/gone")));
         assert!(cache.slots.contains_key(&github_key("o/kept")));
+    }
+
+    #[test]
+    fn disappeared_sole_agent_keeps_died_stage_visible_through_grace() {
+        let t0 = Instant::now();
+        let rows = agent_rows(vec![info("working", "/dev/a/one")]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(&rows, &mut lookup, t0);
+        // Issue 7's run was dispatched to the sole agent's pane.
+        let mut dispatched = jev("r1", "issue_dispatched", 7);
+        dispatched.data =
+            Some(serde_json::json!({"workspace_id": "w1", "pane_id": "w1:p-working"}));
+        cache.refresh_journals(&|_| vec![dispatched.clone()]);
+        let ticket = due_ticket(&cache, "o/one", t0);
+        assert!(cache.record_fetch(&ticket, Ok(vec![numbered_issue(7, &[])]), Ok(vec![]), t0));
+        // The agent dies: the next poll sees an empty live set. Inside the
+        // grace window the repo row stays on the dashboard, and the issue
+        // renders died-mid-run rather than vanishing.
+        cache.sync(&[], &mut lookup, t0 + Duration::from_secs(3));
+        let dash = dashboard(Ok(vec![]), &cache);
+        assert_eq!(dash.groups.len(), 1);
+        let view = &dash.groups[0].repos[0];
+        assert_eq!(view.key, "o/one");
+        assert_eq!(view.agent_count, 0);
+        let rows = view.issue_rows.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(rows[0].stage, journal::Stage::Died);
+        // A terminal event written during the window supersedes the died
+        // heuristic on the next journal refresh...
+        let mut closed = jev("r1", "issue_dispatched", 7);
+        closed.data = Some(serde_json::json!({"workspace_id": "w1", "pane_id": "w1:p-working"}));
+        cache.refresh_journals(&|_| vec![closed.clone(), jev("r1", "issue_closed", 7)]);
+        let dash = dashboard(Ok(vec![]), &cache);
+        let view = &dash.groups[0].repos[0];
+        let rows = view.issue_rows.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(rows[0].stage, journal::Stage::Done);
+        // ...and past the grace period the repo row drops entirely.
+        cache.sync(
+            &[],
+            &mut lookup,
+            t0 + Duration::from_secs(3) + GONE_GRACE + Duration::from_secs(1),
+        );
+        assert!(dashboard(Ok(vec![]), &cache).groups.is_empty());
     }
 
     #[test]
@@ -837,7 +947,7 @@ mod tests {
         ]);
         let mut cache = SlotCache::default();
         let mut lookup = |_: &Path| github_remote("acme/repo");
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         assert_eq!(cache.slots.len(), 1, "one cache entry for the repo");
         assert_eq!(cache.slots[&github_key("acme/repo")].agent_count, 3);
         // Exactly one due fetch for the repo, not one per cwd.
@@ -860,7 +970,7 @@ mod tests {
         let rows = agent_rows(vec![info("working", "/dev/a/work")]);
         let key = SlotKey::Local(PathBuf::from("/dev/a/work"));
         let mut cache = SlotCache::default();
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         let first = cache.slots[&key].generation;
         assert_eq!(cache.slots[&key].remote, Remote::NoOrigin);
         // State cached under the old classification (injected: production
@@ -874,7 +984,7 @@ mod tests {
         *remote.borrow_mut() = Remote::NonGitHub {
             host: "gitlab.com".to_string(),
         };
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         let slot = &cache.slots[&key];
         assert_eq!(
             slot.remote,
@@ -888,14 +998,14 @@ mod tests {
         assert_eq!(slot.agent_count, 1);
         // A further move to a git-error state is tracked the same way.
         *remote.borrow_mut() = Remote::GitError("not a repo".to_string());
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         assert_eq!(
             cache.slots[&key].remote,
             Remote::GitError("not a repo".to_string())
         );
         // An unchanged classification keeps slot, generation, and state.
         let stable = cache.slots[&key].generation;
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         assert_eq!(cache.slots[&key].generation, stable);
     }
 
@@ -904,7 +1014,7 @@ mod tests {
         let rows = agent_rows(vec![info("working", "/dev/a/one")]);
         let mut cache = SlotCache::default();
         let mut lookup = |_: &Path| github_remote("o/one");
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         let ticket = due_ticket(&cache, "o/one", Instant::now());
         // The herdr poll fails: the live repo set is invalidated.
         cache.invalidate();
@@ -919,24 +1029,35 @@ mod tests {
         assert_eq!(dash.agents.unwrap_err(), "server not running");
         assert!(dash.groups.is_empty());
         // The next successful poll re-populates and re-fetches from scratch.
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         assert_eq!(cache.due_github_repos(Instant::now(), GH_TTL).len(), 1);
     }
 
     #[test]
     fn stale_ticket_after_remove_and_readd_is_rejected() {
+        let t0 = Instant::now();
         let mut cache = SlotCache::default();
         let mut lookup = |_: &Path| github_remote("o/one");
         cache.sync(
             &agent_rows(vec![info("working", "/dev/a/one")]),
             &mut lookup,
+            t0,
         );
-        let old = due_ticket(&cache, "o/one", Instant::now());
-        // The repo leaves the session entirely...
-        cache.sync(&[], &mut lookup);
+        let old = due_ticket(&cache, "o/one", t0);
+        // The repo leaves the session entirely (past the grace window)...
+        cache.sync(&[], &mut lookup, t0 + Duration::from_secs(1));
+        cache.sync(
+            &[],
+            &mut lookup,
+            t0 + Duration::from_secs(1) + GONE_GRACE + Duration::from_secs(1),
+        );
         assert!(cache.slots.is_empty());
         // ...then a different worktree brings the same repo back.
-        cache.sync(&agent_rows(vec![info("idle", "/dev/wt/one")]), &mut lookup);
+        cache.sync(
+            &agent_rows(vec![info("idle", "/dev/wt/one")]),
+            &mut lookup,
+            t0 + GONE_GRACE + Duration::from_secs(2),
+        );
         // The old in-flight completion must not overwrite the new entry.
         assert!(!cache.record_fetch(
             &old,
@@ -959,12 +1080,12 @@ mod tests {
         let mut lookup = |_: &Path| remote.borrow().clone();
         let rows = agent_rows(vec![info("working", "/dev/a/one")]);
         let mut cache = SlotCache::default();
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         let old = due_ticket(&cache, "o/before", Instant::now());
         // The cwd's origin now points at a different repo (RemoteCache TTL
         // expired and git answered differently).
         *remote.borrow_mut() = github_remote("o/after");
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         assert!(!cache.slots.contains_key(&github_key("o/before")));
         assert!(cache.slots.contains_key(&github_key("o/after")));
         assert!(!cache.record_fetch(&old, Ok(vec![]), Ok(vec![]), Instant::now()));
@@ -989,7 +1110,7 @@ mod tests {
             "/dev/a/stale" => github_remote("o/stale"),
             _ => Remote::NoOrigin, // never due
         };
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, now);
         // Fresh: completed inside the TTL. Stale: completed past it.
         let fresh = due_ticket(&cache, "o/fresh", now);
         assert!(cache.record_fetch(
@@ -1025,6 +1146,7 @@ mod tests {
         cache.sync(
             &agent_rows(vec![info("working", "/dev/a/one")]),
             &mut lookup,
+            Instant::now(),
         );
         let ticket = due_ticket(&cache, "o/one", Instant::now());
         let issues = gh.open_issues(&ticket.repo).map_err(|e| e.to_string());
@@ -1051,7 +1173,7 @@ mod tests {
             "/dev/a/beta" => github_remote("acme/beta"),
             _ => Remote::NoOrigin,
         };
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         let dash = dashboard(Ok(rows), &cache);
         assert_eq!(dash.agents.unwrap().len(), 4);
         let orgs: Vec<&str> = dash.groups.iter().map(|g| g.org.as_str()).collect();
@@ -1082,7 +1204,7 @@ mod tests {
             },
             _ => Remote::NoOrigin,
         };
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         assert_eq!(cache.slots.len(), 4, "no collapse by basename");
         let dash = dashboard(Ok(rows), &cache);
         let orgs: Vec<&str> = dash.groups.iter().map(|g| g.org.as_str()).collect();
@@ -1197,7 +1319,7 @@ mod tests {
             "/dev/a/gh" => github_remote("o/gh"),
             _ => Remote::NoOrigin,
         };
-        cache.sync(&rows, &mut lookup);
+        cache.sync(&rows, &mut lookup, Instant::now());
         let reader = |cwds: &BTreeSet<PathBuf>| {
             assert_eq!(
                 cwds.iter().collect::<Vec<_>>(),
@@ -1221,6 +1343,7 @@ mod tests {
         cache.sync(
             &agent_rows(vec![info("working", "/dev/a/one")]),
             &mut lookup,
+            Instant::now(),
         );
         let dash = dashboard(Err("server not running".to_string()), &cache);
         assert_eq!(dash.agents.unwrap_err(), "server not running");

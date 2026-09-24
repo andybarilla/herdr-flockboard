@@ -9,7 +9,7 @@ Status: **workflow stage board**. The dashboard TUI shows every agent in the
 herdr session with its status, plus per-repo open issues by Flock state label
 — each with its derived workflow stage (dispatched, pr open, checks pending/
 failing, mergeable, review clean/blocking, rework in progress, awaiting
-merge, done, stopped, or died-mid-run unknown) — and open PRs with
+merge, merged, done, stopped, or died-mid-run unknown) — and open PRs with
 check/review state, grouped by git-origin organization. Read-only; the
 waiting-on-me inbox is still a roadmap item (below).
 
@@ -76,10 +76,16 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
   repo's live checkouts on every agent poll, correlated with PR
   checks/mergeability (using the project-config green classifier:
   SKIPPED/NEUTRAL satisfied, unknown fail-closed) and herdr agent liveness.
-  The reader is tolerant — a missing, truncated, or forward-versioned journal
+  The reader is tolerant — a missing, truncated, corrupted (non-UTF-8), or
+  forward-versioned journal
   degrades to label/PR-inferred stages rather than blanking the board — and a
   run with no terminal event whose supervising agent is gone shows as
-  `unknown (run may have died)`.
+  `unknown (run may have died)`. So that died-mid-run state stays visible
+  even when the dead agent was the repo's only one, a repo row is retained
+  for a bounded 120s grace period after its last agent disappears (rendered
+  with zero agents) before being pruned; a terminal journal event
+  (`issue_closed`/`run_stopped`) supersedes the died heuristic as soon as a
+  supervisor writes it.
 
 ## Roadmap
 

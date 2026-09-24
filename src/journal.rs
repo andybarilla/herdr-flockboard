@@ -2,9 +2,9 @@
 //! flock#45) and the per-issue workflow-stage derivation built on it. The
 //! journal is advisory and written only by Flock supervisors, so everything
 //! here is read-only and fail-tolerant: a missing file, a truncated final
-//! line (crash mid-append), unknown event names (the schema is
-//! additive-only), and events from other workflows all degrade to fewer
-//! known facts, never to an error.
+//! line (crash mid-append), non-UTF-8 bytes in a corrupt tail, unknown event
+//! names (the schema is additive-only), and events from other workflows all
+//! degrade to fewer known facts, never to an error.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -97,10 +97,12 @@ pub fn parse_events(text: &str) -> Vec<Event> {
 
 /// Reads one candidate journal file. `None` when the file is missing or
 /// unreadable — an absent journal is a normal state (repo not under Flock
-/// management), not an error.
+/// management), not an error. Bytes are decoded lossily: a corrupt tail
+/// with invalid UTF-8 ruins only the line it lands on (the replacement
+/// character makes it unparseable), so every valid prior line survives.
 fn read_file(path: &Path) -> Option<Vec<Event>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(parse_events(&text))
+    let bytes = std::fs::read(path).ok()?;
+    Some(parse_events(&String::from_utf8_lossy(&bytes)))
 }
 
 /// Reads the journal for a repo given its live local checkouts. Several
@@ -117,9 +119,10 @@ pub fn read_repo_events(cwds: &BTreeSet<PathBuf>) -> Vec<Event> {
 
 /// The green classifier for a PR's checks, mirroring the verified
 /// check-wait semantics in `docs/flock/project.md`: SKIPPED/NEUTRAL
-/// conclusions count as satisfied, and anything unrecognized (a rollup
-/// entry with neither a check-run nor a status-context shape) is
-/// fail-closed — it classifies as failing.
+/// conclusions count as satisfied, and anything unrecognized — a rollup
+/// entry with neither a check-run nor a status-context shape, an unknown
+/// check-run conclusion, an unknown status-context state — is fail-closed:
+/// it classifies as failing, never as merely pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrGreen {
     /// `mergeable: MERGEABLE` and every rollup entry satisfied.
@@ -131,48 +134,58 @@ pub enum PrGreen {
     Failing,
 }
 
+/// Where one rollup entry lands. `Bad` is deliberately broad: the
+/// classifier fails closed, so every shape or value not explicitly known
+/// to be satisfied or still-running counts as failing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckState {
+    Ok,
+    Pending,
+    Bad,
+}
+
 /// A rollup entry is check-run-shaped when it carries `status` or
 /// `conclusion` (gh emits check runs with both keys, conclusion possibly
 /// null while running), status-context-shaped when it carries `state`.
-fn entry_ok(r: &CheckRollup) -> bool {
+fn check_state(r: &CheckRollup) -> CheckState {
     if r.status.is_some() || r.conclusion.is_some() {
-        r.status.as_deref() == Some("COMPLETED")
-            && matches!(
-                r.conclusion.as_deref(),
-                Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
-            )
-    } else if r.state.is_some() {
-        r.state.as_deref() == Some("SUCCESS")
+        // A set conclusion means the run completed: only the
+        // known-satisfying conclusions pass; known failures and any
+        // unrecognized conclusion (additive schema change) fail closed.
+        if let Some(conclusion) = r.conclusion.as_deref() {
+            return match conclusion {
+                "SUCCESS" | "SKIPPED" | "NEUTRAL" => CheckState::Ok,
+                _ => CheckState::Bad,
+            };
+        }
+        match r.status.as_deref() {
+            // Known still-running check-run statuses.
+            Some("QUEUED") | Some("IN_PROGRESS") | Some("WAITING") | Some("PENDING")
+            | Some("REQUESTED") => CheckState::Pending,
+            // COMPLETED with no conclusion, or an unrecognized status:
+            // fail closed.
+            _ => CheckState::Bad,
+        }
+    } else if let Some(state) = r.state.as_deref() {
+        match state {
+            "SUCCESS" => CheckState::Ok,
+            // Known still-running status-context states.
+            "PENDING" | "EXPECTED" => CheckState::Pending,
+            // Known failures and anything unrecognized fail closed.
+            _ => CheckState::Bad,
+        }
     } else {
-        false
-    }
-}
-
-fn entry_bad(r: &CheckRollup) -> bool {
-    if r.status.is_some() || r.conclusion.is_some() {
-        r.status.as_deref() == Some("COMPLETED")
-            && matches!(
-                r.conclusion.as_deref(),
-                Some("FAILURE")
-                    | Some("CANCELLED")
-                    | Some("TIMED_OUT")
-                    | Some("ACTION_REQUIRED")
-                    | Some("STARTUP_FAILURE")
-            )
-    } else if r.state.is_some() {
-        matches!(r.state.as_deref(), Some("ERROR") | Some("FAILURE"))
-    } else {
-        true // unrecognized shape: fail closed
+        CheckState::Bad // unrecognized shape: fail closed
     }
 }
 
 pub fn classify_green(checks: &[CheckRollup], mergeable: &str) -> PrGreen {
-    if checks.iter().any(entry_bad) {
+    if checks.iter().any(|r| check_state(r) == CheckState::Bad) {
         return PrGreen::Failing;
     }
     // With no checks at all the "all satisfied" half is vacuous, matching
     // the project-config jq: mergeability alone decides.
-    if mergeable == "MERGEABLE" && checks.iter().all(entry_ok) {
+    if mergeable == "MERGEABLE" && checks.iter().all(|r| check_state(r) == CheckState::Ok) {
         PrGreen::Green
     } else {
         PrGreen::Pending
@@ -239,6 +252,11 @@ pub enum Stage {
     ReviewBlocking,
     ReworkInProgress,
     AwaitingMerge,
+    /// `merge_verified` seen but the issue not yet closed: the post-merge,
+    /// pre-close window. Small spec-consistent extension of the issue #2
+    /// vocabulary — `awaiting merge` would be false (the merge already
+    /// happened) and `done` is reserved for `issue_closed`.
+    Merged,
     Done,
     /// `stopped: <reason>` — the verbatim operator-run stop string.
     Stopped(String),
@@ -265,6 +283,7 @@ impl Stage {
             Self::ReviewBlocking => "review blocking".to_string(),
             Self::ReworkInProgress => "rework in progress".to_string(),
             Self::AwaitingMerge => "awaiting merge".to_string(),
+            Self::Merged => "merged".to_string(),
             Self::Done => "done".to_string(),
             Self::Stopped(reason) => format!("stopped: {reason}"),
             Self::Died => "unknown (run may have died)".to_string(),
@@ -280,7 +299,7 @@ impl Stage {
         match self {
             Self::ReworkInProgress | Self::Dispatched => 0,
             Self::ChecksPending | Self::ChecksFailing | Self::Mergeable | Self::PrOpen => 1,
-            Self::ReviewBlocking | Self::ReviewClean | Self::AwaitingMerge => 2,
+            Self::ReviewBlocking | Self::ReviewClean | Self::AwaitingMerge | Self::Merged => 2,
             Self::Died | Self::Stopped(_) => 3,
             Self::Queued => 4,
             Self::Label(_) | Self::None => 5,
@@ -344,12 +363,14 @@ pub fn derive_stage(facts: &IssueFacts, live: &LiveSet) -> Stage {
         match events[v].verdict() {
             Some("blocking") => return Stage::ReviewBlocking,
             Some("clean") => {
-                // Review clean: green checks (or an already-verified merge)
-                // leave only the operator's merge/close step; ungreen checks
-                // still gate it. With no PR data to classify, the clean
-                // verdict itself is the freshest known state.
+                // Review clean: with `merge_verified` the run is in the
+                // post-merge, pre-close window — no longer "awaiting
+                // merge". Otherwise green checks leave only the operator's
+                // merge/close step; ungreen checks still gate it. With no
+                // PR data to classify, the clean verdict itself is the
+                // freshest known state.
                 if events.iter().any(|e| e.is("merge_verified")) {
-                    return Stage::AwaitingMerge;
+                    return Stage::Merged;
                 }
                 return match facts.pr_green {
                     Some(PrGreen::Green) => Stage::AwaitingMerge,
@@ -477,6 +498,23 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_corrupt_tail_preserves_prior_valid_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let flock = dir.path().join(".flock");
+        std::fs::create_dir_all(&flock).unwrap();
+        let mut bytes =
+            b"{\"run_id\":\"r1\",\"workflow\":\"w\",\"event\":\"pr_opened\",\"repo\":\"o/r\",\"issue\":1}\n"
+                .to_vec();
+        bytes.extend_from_slice(b"{\"run_id\":\"r1\",\"event\":\"iss");
+        bytes.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8 in the tail
+        std::fs::write(flock.join("events.jsonl"), bytes).unwrap();
+        let cwds = BTreeSet::from([dir.path().to_path_buf()]);
+        let events = read_repo_events(&cwds);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "pr_opened");
+    }
+
+    #[test]
     fn unknown_event_names_are_kept_but_match_no_rule() {
         let events = parse_events(
             r#"{"run_id":"r1","workflow":"w","event":"future_event_v2","repo":"o/r","issue":1}"#,
@@ -554,6 +592,33 @@ mod tests {
         assert_eq!(
             classify_green(&[rollup(None, None, None)], "MERGEABLE"),
             PrGreen::Failing
+        );
+        // Unknown completed conclusions and status-context states fail
+        // closed too — an additive schema change must not understate an
+        // unsafe PR as merely pending.
+        assert_eq!(
+            classify_green(
+                &[rollup(Some("COMPLETED"), Some("STALE"), None)],
+                "MERGEABLE"
+            ),
+            PrGreen::Failing
+        );
+        assert_eq!(
+            classify_green(&[rollup(None, None, Some("FUNKY"))], "MERGEABLE"),
+            PrGreen::Failing
+        );
+        assert_eq!(
+            classify_green(&[rollup(Some("COMPLETED"), None, None)], "MERGEABLE"),
+            PrGreen::Failing
+        );
+        // Known still-running states stay pending, not failing.
+        assert_eq!(
+            classify_green(&[rollup(Some("QUEUED"), None, None)], "MERGEABLE"),
+            PrGreen::Pending
+        );
+        assert_eq!(
+            classify_green(&[rollup(None, None, Some("EXPECTED"))], "MERGEABLE"),
+            PrGreen::Pending
         );
         // Mergeability unresolved or conflicting → not green.
         assert_eq!(classify_green(&[], "UNKNOWN"), PrGreen::Pending);
@@ -668,7 +733,36 @@ mod tests {
             events,
             pr_green: Some(PrGreen::Green),
         };
+        assert_eq!(derive_stage(&f, &no_live()), Stage::Merged);
+    }
+
+    #[test]
+    fn merge_verified_is_post_merge_not_awaiting_merge() {
+        // Clean review + green checks, merge not yet verified: the
+        // operator's merge step is all that remains.
+        let mut events = vec![
+            ev("r1", "pr_opened"),
+            ev_data(
+                "r1",
+                "review_verdict",
+                serde_json::json!({"verdict": "clean"}),
+            ),
+        ];
+        let mut f = IssueFacts {
+            labels: vec![],
+            events: events.clone(),
+            pr_green: Some(PrGreen::Green),
+        };
         assert_eq!(derive_stage(&f, &no_live()), Stage::AwaitingMerge);
+        // After the merge is verified the dashboard must not claim it is
+        // still awaiting merge; the post-merge, pre-close window shows
+        // `merged` until `issue_closed` makes it `done`.
+        events.push(ev("r1", "merge_verified"));
+        f.events = events.clone();
+        assert_eq!(derive_stage(&f, &no_live()), Stage::Merged);
+        events.push(ev("r1", "issue_closed"));
+        f.events = events;
+        assert_eq!(derive_stage(&f, &no_live()), Stage::Done);
     }
 
     #[test]
@@ -775,5 +869,6 @@ mod tests {
             "stopped: review blocking"
         );
         assert_eq!(Stage::AwaitingMerge.label(), "awaiting merge");
+        assert_eq!(Stage::Merged.label(), "merged");
     }
 }
