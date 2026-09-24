@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 mod git_org;
 mod github;
 mod herd;
+mod proc;
 mod state;
 mod tui;
 

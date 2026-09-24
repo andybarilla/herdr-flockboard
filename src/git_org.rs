@@ -1,12 +1,19 @@
 //! Repo discovery from agent working directories: each cwd's `origin` remote
 //! classifies the repo (GitHub owner/repo, another host, no origin) and
 //! supplies the organization used to group the board. Modeled on
-//! herdr-scuttlebutt's `git_org.rs`; lookups are cached because the refresh
-//! loop re-resolves every cwd on each agent poll while remotes change rarely.
+//! herdr-scuttlebutt's `git_org.rs`; lookups are cached because remotes
+//! change rarely while the agent poll runs every few seconds.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
+
+use crate::proc::run_with_timeout;
+
+/// A wedged git (e.g. on a dead network mount) degrades the repo to the
+/// inline git-error state after this rather than stalling the agent poll.
+const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a remote lookup is trusted. Worktrees come and go under a
 /// long-lived dashboard, so entries expire rather than pinning the first
@@ -30,11 +37,11 @@ pub enum Remote {
 
 /// Resolves the `origin` remote of the repo containing `cwd`.
 pub fn remote_for(cwd: &Path) -> Remote {
-    let out = std::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(cwd)
-        .args(["config", "--get", "remote.origin.url"])
-        .output();
+        .args(["config", "--get", "remote.origin.url"]);
+    let out = run_with_timeout(&mut cmd, GIT_TIMEOUT);
     match out {
         Err(e) => Remote::GitError(e.to_string()),
         Ok(o) if !o.status.success() => Remote::NoOrigin,

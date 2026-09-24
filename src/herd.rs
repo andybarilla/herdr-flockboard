@@ -2,8 +2,17 @@
 //! dashboard's state derivation is testable without a herdr server. Modeled
 //! on herdr-scuttlebutt's `herd.rs`.
 
+use std::process::Command;
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+
+use crate::proc::run_with_timeout;
+
+/// A wedged herdr server turns into the inline "herdr unreachable" state
+/// after this rather than stalling the agent board.
+const HERD_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentInfo {
@@ -105,10 +114,10 @@ impl Default for HerdCli {
 
 impl HerdControl for HerdCli {
     fn list_agents(&self) -> Result<Vec<AgentInfo>> {
-        let out = std::process::Command::new(&self.bin)
-            .args(["agent", "list"])
-            .output()
-            .with_context(|| format!("spawning `{} agent list`", self.bin))?;
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(["agent", "list"]);
+        let out = run_with_timeout(&mut cmd, HERD_TIMEOUT)
+            .with_context(|| format!("running `{} agent list`", self.bin))?;
         if !out.status.success() {
             bail!(
                 "`{} agent list` failed: {}",

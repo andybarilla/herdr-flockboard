@@ -2,8 +2,17 @@
 //! trait so state derivation is testable without GitHub. Fetching is raw
 //! data only; bucketing and status classification live in `state.rs`.
 
+use std::process::Command;
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+
+use crate::proc::run_with_timeout;
+
+/// A hung network or API call becomes an inline per-repo error after this,
+/// so one slow repo can never freeze the GitHub refresh worker.
+const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Issue {
@@ -114,15 +123,15 @@ pub fn parse_prs(json: &str) -> Result<Vec<PullRequest>> {
 }
 
 /// Real implementation: shells out to `gh`. Failures (auth, network, repo
-/// gone) are returned as errors so the board can render them inline per repo.
+/// gone, timeout) are returned as errors so the board can render them
+/// inline per repo.
 pub struct GhCli;
 
 impl GhCli {
     fn run(&self, args: &[&str]) -> Result<String> {
-        let out = std::process::Command::new("gh")
-            .args(args)
-            .output()
-            .context("spawning gh")?;
+        let mut cmd = Command::new("gh");
+        cmd.args(args);
+        let out = run_with_timeout(&mut cmd, GH_TIMEOUT).context("running gh")?;
         if !out.status.success() {
             bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
         }

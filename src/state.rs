@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::git_org::Remote;
-use crate::github::{CheckRollup, Issue, IssueTracker, PullRequest};
+use crate::github::{CheckRollup, Issue, PullRequest};
 use crate::herd::AgentInfo;
 
 /// How often the agent board re-polls `herdr agent list`.
@@ -230,8 +230,9 @@ pub fn pr_rows(prs: &[PullRequest]) -> Vec<PrRow> {
 }
 
 /// Cached per-repo GitHub state. Created when an agent's cwd first names a
-/// repo; raw fetch results (including errors) are cached so a flaky `gh`
-/// does not get retried on every 3s agent poll.
+/// repo and pruned when no live agent references it anymore; raw fetch
+/// results (including errors) are cached so a flaky `gh` is retried on the
+/// refresh TTL, not continuously.
 pub struct RepoSlot {
     pub cwd: PathBuf,
     pub remote: Remote,
@@ -253,12 +254,15 @@ impl RepoSlot {
 }
 
 /// Registers a slot for every cwd the live agents named, resolving the
-/// remote through `lookup` (a `RemoteCache` in production) for new cwds only.
+/// remote through `lookup` (a `RemoteCache` in production) for new cwds
+/// only, and drops slots whose cwd no live agent named anymore — GitHub
+/// work and cache only ever track repos currently in use.
 pub fn sync_slots(
     rows: &[AgentRow],
     slots: &mut HashMap<PathBuf, RepoSlot>,
     lookup: &mut dyn FnMut(&Path) -> Remote,
 ) {
+    slots.retain(|cwd, _| rows.iter().any(|row| row.cwd == *cwd));
     for row in rows {
         slots
             .entry(row.cwd.clone())
@@ -266,30 +270,41 @@ pub fn sync_slots(
     }
 }
 
-/// Refetches every GitHub-hosted slot whose TTL has expired. Non-GitHub
-/// remotes are never fetched — their inline state explains why. Both the
-/// issue and PR result are stored, errors included, so the board shows what
-/// `gh` said rather than a spinner forever.
-pub fn refresh_due(
-    gh: &dyn IssueTracker,
-    slots: &mut HashMap<PathBuf, RepoSlot>,
+/// GitHub-hosted slots due for a refetch, as (cwd, "owner/repo") pairs the
+/// GitHub worker can fetch without holding the slots lock. Non-GitHub
+/// remotes are never listed — their inline state explains why — and a slot
+/// inside its TTL keeps its cached data, errors included, so a flaky `gh`
+/// is not retried on every agent poll.
+pub fn due_github_repos(
+    slots: &HashMap<PathBuf, RepoSlot>,
     now: Instant,
     ttl: Duration,
+) -> Vec<(PathBuf, String)> {
+    slots
+        .iter()
+        .filter_map(|(cwd, slot)| {
+            let Remote::GitHub { repo, .. } = &slot.remote else {
+                return None;
+            };
+            let due = slot
+                .fetched_at
+                .is_none_or(|at| now.duration_since(at) >= ttl);
+            due.then(|| (cwd.clone(), repo.clone()))
+        })
+        .collect()
+}
+
+/// Stores a finished fetch — errors included — so the board shows what `gh`
+/// actually said rather than a spinner forever.
+pub fn record_fetch(
+    slot: &mut RepoSlot,
+    issues: Result<Vec<Issue>, String>,
+    prs: Result<Vec<PullRequest>, String>,
+    at: Instant,
 ) {
-    for slot in slots.values_mut() {
-        let Remote::GitHub { repo, .. } = &slot.remote else {
-            continue;
-        };
-        let due = slot
-            .fetched_at
-            .is_none_or(|at| now.duration_since(at) >= ttl);
-        if !due {
-            continue;
-        }
-        slot.issues = Some(gh.open_issues(repo).map_err(|e| e.to_string()));
-        slot.prs = Some(gh.open_prs(repo).map_err(|e| e.to_string()));
-        slot.fetched_at = Some(now);
-    }
+    slot.issues = Some(issues);
+    slot.prs = Some(prs);
+    slot.fetched_at = Some(at);
 }
 
 /// What the board renders for one repo: identity, grouping, fetch state.
@@ -399,7 +414,7 @@ pub fn dashboard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::FakeTracker;
+    use crate::github::{FakeTracker, IssueTracker};
 
     fn info(status: &str, cwd: &str) -> AgentInfo {
         AgentInfo {
@@ -555,57 +570,85 @@ mod tests {
     }
 
     #[test]
-    fn refresh_due_fetches_github_repos_and_respects_ttl() {
+    fn sync_slots_prunes_repos_no_longer_live() {
         let mut slots = HashMap::new();
-        slots.insert(
-            PathBuf::from("/dev/a/one"),
-            github_slot("/dev/a/one", "o/one"),
+        let mut gone = github_slot("/dev/a/gone", "o/gone");
+        record_fetch(
+            &mut gone,
+            Ok(vec![issue(&["blocked"])]),
+            Ok(vec![]),
+            Instant::now(),
         );
+        slots.insert(PathBuf::from("/dev/a/gone"), gone);
+        slots.insert(
+            PathBuf::from("/dev/a/kept"),
+            github_slot("/dev/a/kept", "o/kept"),
+        );
+        // Only /dev/a/kept is live now.
+        let rows = agent_rows(vec![info("working", "/dev/a/kept")]);
+        let mut lookup = |_: &Path| Remote::NoOrigin;
+        sync_slots(&rows, &mut slots, &mut lookup);
+        assert!(!slots.contains_key(Path::new("/dev/a/gone")));
+        assert!(slots.contains_key(Path::new("/dev/a/kept")));
+    }
+
+    #[test]
+    fn due_github_repos_selects_only_due_github_slots() {
+        let now = Instant::now();
+        let mut slots = HashMap::new();
+        // Never fetched: due.
+        slots.insert(
+            PathBuf::from("/dev/a/new"),
+            github_slot("/dev/a/new", "o/new"),
+        );
+        // Non-GitHub: never due.
         slots.insert(
             PathBuf::from("/dev/a/plain"),
             RepoSlot::new(PathBuf::from("/dev/a/plain"), Remote::NoOrigin),
         );
-        let gh = FakeTracker {
-            issues: Ok(vec![issue(&["ready-for-agent"])]),
-            prs: Ok(vec![]),
-        };
-        let now = Instant::now();
-        refresh_due(&gh, &mut slots, now, GH_TTL);
-        assert!(slots[Path::new("/dev/a/one")].issues.is_some());
-        // No-origin repos are never fetched.
-        assert!(slots[Path::new("/dev/a/plain")].issues.is_none());
-        // Inside the TTL, no refetch: overwrite the data and confirm it survives.
-        slots.get_mut(Path::new("/dev/a/one")).unwrap().issues = Some(Err("sentinel".to_string()));
-        refresh_due(&gh, &mut slots, now + Duration::from_secs(10), GH_TTL);
+        // Fresh: inside the TTL, not due.
+        let mut fresh = github_slot("/dev/a/fresh", "o/fresh");
+        record_fetch(
+            &mut fresh,
+            Ok(vec![]),
+            Ok(vec![]),
+            now - Duration::from_secs(10),
+        );
+        slots.insert(PathBuf::from("/dev/a/fresh"), fresh);
+        // Stale: past the TTL, due.
+        let mut stale = github_slot("/dev/a/stale", "o/stale");
+        record_fetch(
+            &mut stale,
+            Ok(vec![]),
+            Ok(vec![]),
+            now - GH_TTL - Duration::from_secs(1),
+        );
+        slots.insert(PathBuf::from("/dev/a/stale"), stale);
+
+        let mut due = due_github_repos(&slots, now, GH_TTL);
+        due.sort();
         assert_eq!(
-            slots[Path::new("/dev/a/one")].issues,
-            Some(Err("sentinel".to_string()))
+            due,
+            vec![
+                (PathBuf::from("/dev/a/new"), "o/new".to_string()),
+                (PathBuf::from("/dev/a/stale"), "o/stale".to_string()),
+            ]
         );
-        // Past the TTL it refetches.
-        refresh_due(
-            &gh,
-            &mut slots,
-            now + GH_TTL + Duration::from_secs(1),
-            GH_TTL,
-        );
-        assert!(matches!(slots[Path::new("/dev/a/one")].issues, Some(Ok(_))));
     }
 
     #[test]
-    fn refresh_due_stores_gh_errors_for_inline_rendering() {
-        let mut slots = HashMap::new();
-        slots.insert(
-            PathBuf::from("/dev/a/one"),
-            github_slot("/dev/a/one", "o/one"),
-        );
+    fn record_fetch_stores_tracker_results_errors_included() {
         let gh = FakeTracker {
             issues: Err("gh: auth required".to_string()),
-            prs: Err("gh: auth required".to_string()),
+            prs: Ok(vec![]),
         };
-        refresh_due(&gh, &mut slots, Instant::now(), GH_TTL);
-        let view = repo_view(&slots[Path::new("/dev/a/one")], 1);
+        let mut slot = github_slot("/dev/a/one", "o/one");
+        let issues = gh.open_issues("o/one").map_err(|e| e.to_string());
+        let prs = gh.open_prs("o/one").map_err(|e| e.to_string());
+        record_fetch(&mut slot, issues, prs, Instant::now());
+        let view = repo_view(&slot, 1);
         assert_eq!(view.issues, Some(Err("gh: auth required".to_string())));
-        assert_eq!(view.prs, Some(Err("gh: auth required".to_string())));
+        assert_eq!(view.prs, Some(Ok(vec![])));
         assert!(view.fetched_at.is_some());
     }
 

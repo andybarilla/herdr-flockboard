@@ -58,8 +58,9 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
 ## Data sources
 
 - Live agents, statuses, panes, and cwds: `herdr agent list`, polled every 3s.
-- Issues and PRs per repo: `gh`, cached with a 45s TTL and refreshed off the
-  UI path so the board never blocks on GitHub.
+- Issues and PRs per repo: `gh`, cached with a 45s TTL and refreshed by a
+  dedicated worker thread with a bounded per-command timeout, so a slow or
+  hung `gh` never stalls the board.
 - Repo grouping: git origin organization, the same per-company grouping
   `herdr-scuttlebutt` uses for its rooms.
 - (Planned) Workflow stage per issue: the Flock event journal (`<repo>/.flock/events.jsonl`,
