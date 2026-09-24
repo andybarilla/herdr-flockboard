@@ -66,6 +66,9 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
   same GitHub repo collapse into one row (one `gh` fetch per owner/repo,
   agent counts aggregated), and a failed `herdr` poll clears the live repo
   set — and with it any GitHub eligibility — until the poll recovers.
+  Repos without a usable GitHub origin (no origin, another host, or a
+  broken/missing cwd) are keyed and rendered by full working-directory
+  path, so same-named directories in different locations stay distinct.
 - (Planned) Workflow stage per issue: the Flock event journal (`<repo>/.flock/events.jsonl`,
   see [flock#45](https://github.com/andybarilla/flock/issues/45)) plus inference
   from labels and PR state.

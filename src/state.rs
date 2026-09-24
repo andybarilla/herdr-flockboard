@@ -254,8 +254,9 @@ impl SlotKey {
 /// names a slot key and pruned when nothing live references it anymore;
 /// raw fetch results (including errors) are cached so a flaky `gh` is
 /// retried on the refresh TTL, not continuously. `generation` is bumped
-/// on every creation so a fetch that started against a since-pruned slot
-/// cannot write its result into the replacement.
+/// on every creation or reclassification so a fetch that started against
+/// a since-pruned or reclassified slot cannot write its result into the
+/// replacement.
 pub struct RepoSlot {
     pub remote: Remote,
     pub generation: u64,
@@ -309,10 +310,14 @@ impl SlotCache {
     /// cwd through `lookup` (a `RemoteCache` in production, so this is a
     /// map hit after first sight), refreshes per-slot agent counts, prunes
     /// slots nothing live references anymore, and creates slots for newly
-    /// seen keys with a fresh generation. A cwd whose remote lookup was
-    /// reclassified since the last poll maps to a different key, so its old
-    /// slot is pruned and the new one starts empty with a new generation —
-    /// an in-flight fetch for the old identity is rejected on writeback.
+    /// seen keys with a fresh generation. A cwd reclassified to or from a
+    /// GitHub identity maps to a different key, so its old slot is pruned
+    /// and the new one starts empty with a new generation — an in-flight
+    /// fetch for the old identity is rejected on writeback. A local cwd
+    /// that keeps its key but moves among NoOrigin/NonGitHub/GitError is
+    /// reclassified in place: the slot is replaced wholesale (fresh
+    /// generation, no cached state) so nothing from the old
+    /// classification survives.
     pub fn sync(&mut self, rows: &[AgentRow], lookup: &mut dyn FnMut(&Path) -> Remote) {
         let mut live: BTreeMap<SlotKey, (Remote, usize)> = BTreeMap::new();
         for row in rows {
@@ -325,7 +330,11 @@ impl SlotCache {
         self.slots.retain(|key, _| live.contains_key(key));
         for (key, (remote, count)) in live {
             match self.slots.get_mut(&key) {
-                Some(slot) => slot.agent_count = count,
+                Some(slot) if slot.remote == remote => slot.agent_count = count,
+                Some(slot) => {
+                    self.generation += 1;
+                    *slot = RepoSlot::new(remote, self.generation, count);
+                }
                 None => {
                     self.generation += 1;
                     self.slots
@@ -408,12 +417,12 @@ pub struct RepoView {
 }
 
 pub fn repo_view(key: &SlotKey, slot: &RepoSlot) -> RepoView {
-    // Display name for local states, where no owner/repo identity exists.
+    // Display name for local states, where no owner/repo identity exists:
+    // the full cwd, not the basename. Local slots are keyed by complete
+    // path precisely because /a/work and /b/work are unrelated repos, and
+    // rendering only the basename would make them identical.
     let dir = match key {
-        SlotKey::Local(cwd) => cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| cwd.display().to_string()),
+        SlotKey::Local(cwd) => cwd.display().to_string(),
         SlotKey::GitHub(repo) => repo.clone(),
     };
     let (key, org) = match &slot.remote {
@@ -717,6 +726,52 @@ mod tests {
     }
 
     #[test]
+    fn local_slot_tracks_remote_reclassification_with_new_generation() {
+        let remote = std::cell::RefCell::new(Remote::NoOrigin);
+        let mut lookup = |_: &Path| remote.borrow().clone();
+        let rows = agent_rows(vec![info("working", "/dev/a/work")]);
+        let key = SlotKey::Local(PathBuf::from("/dev/a/work"));
+        let mut cache = SlotCache::default();
+        cache.sync(&rows, &mut lookup);
+        let first = cache.slots[&key].generation;
+        assert_eq!(cache.slots[&key].remote, Remote::NoOrigin);
+        // State cached under the old classification (injected: production
+        // never fetches for a local slot, but the reset must not depend on
+        // that) must not survive reclassification.
+        let slot = cache.slots.get_mut(&key).unwrap();
+        slot.issues = Some(Ok(vec![]));
+        slot.fetched_at = Some(Instant::now());
+        // The same cwd's origin now points at a non-GitHub host (RemoteCache
+        // TTL expired and git answered differently): the slot must follow.
+        *remote.borrow_mut() = Remote::NonGitHub {
+            host: "gitlab.com".to_string(),
+        };
+        cache.sync(&rows, &mut lookup);
+        let slot = &cache.slots[&key];
+        assert_eq!(
+            slot.remote,
+            Remote::NonGitHub {
+                host: "gitlab.com".to_string(),
+            }
+        );
+        assert_ne!(slot.generation, first, "reclassification bumps generation");
+        assert!(slot.issues.is_none(), "old classification's state cleared");
+        assert!(slot.fetched_at.is_none());
+        assert_eq!(slot.agent_count, 1);
+        // A further move to a git-error state is tracked the same way.
+        *remote.borrow_mut() = Remote::GitError("not a repo".to_string());
+        cache.sync(&rows, &mut lookup);
+        assert_eq!(
+            cache.slots[&key].remote,
+            Remote::GitError("not a repo".to_string())
+        );
+        // An unchanged classification keeps slot, generation, and state.
+        let stable = cache.slots[&key].generation;
+        cache.sync(&rows, &mut lookup);
+        assert_eq!(cache.slots[&key].generation, stable);
+    }
+
+    #[test]
     fn invalidate_clears_live_set_and_rejects_in_flight_completions() {
         let rows = agent_rows(vec![info("working", "/dev/a/one")]);
         let mut cache = SlotCache::default();
@@ -877,7 +932,7 @@ mod tests {
         let keys: Vec<&str> = acme.repos.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, vec!["acme/beta", "acme/zeta"]);
         assert_eq!(acme.repos[0].agent_count, 2);
-        assert_eq!(dash.groups[1].repos[0].key, "local");
+        assert_eq!(dash.groups[1].repos[0].key, "/dev/a/local");
     }
 
     #[test]
@@ -906,8 +961,10 @@ mod tests {
         assert_eq!(orgs, vec!["gitlab.com", NO_ORG_GROUP]);
         let no_org = &dash.groups[1].repos;
         let keys: Vec<&str> = no_org.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, vec!["broken", "work", "work"]);
-        assert_eq!(dash.groups[0].repos[0].key, "mirror (gitlab.com)");
+        // Rendered by full cwd: the same-basename repos stay visibly
+        // distinct, not two identical "work" rows.
+        assert_eq!(keys, vec!["/dev/x/work", "/dev/y/work", "/dev/z/broken"]);
+        assert_eq!(dash.groups[0].repos[0].key, "/dev/w/mirror (gitlab.com)");
     }
 
     #[test]

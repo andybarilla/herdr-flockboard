@@ -1,12 +1,13 @@
 //! Repo discovery from agent working directories: each cwd's `origin` remote
-//! classifies the repo (GitHub owner/repo, another host, no origin) and
+//! classifies the repo (GitHub owner/repo, another host, no origin) or the
+//! lookup itself fails (non-repo, missing cwd, git error). The classification
 //! supplies the organization used to group the board. Modeled on
 //! herdr-scuttlebutt's `git_org.rs`; lookups are cached because remotes
 //! change rarely while the agent poll runs every few seconds.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use crate::proc::run_with_timeout;
@@ -25,7 +26,7 @@ pub enum Remote {
     /// GitHub-hosted. `repo` is "owner/name" as `gh --repo` expects it;
     /// `org` (the owner) is the board's grouping key.
     GitHub { org: String, repo: String },
-    /// The directory is a repo (or git answered) but has no `origin` remote.
+    /// A valid git work tree that has no `origin` remote.
     NoOrigin,
     /// An origin exists but is not github.com: another host, or a local path
     /// (`host` is "local path" then). Rendered as an inline skip state; `gh`
@@ -35,17 +36,48 @@ pub enum Remote {
     GitError(String),
 }
 
-/// Resolves the `origin` remote of the repo containing `cwd`.
+/// Resolves the `origin` remote of the repo containing `cwd`. Only a valid
+/// work tree that simply lacks an origin is `NoOrigin`; everything broken —
+/// non-repo, missing or deleted cwd, unreadable `.git`, a git failure — is
+/// `GitError`, never conflated with it.
 pub fn remote_for(cwd: &Path) -> Remote {
+    // Preflight: `NoOrigin` may only be reached from a real work tree.
+    // `git -C` also surfaces a missing/deleted cwd as a failure here.
+    let mut preflight = Command::new("git");
+    preflight
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--is-inside-work-tree"]);
+    match run_with_timeout(&mut preflight, GIT_TIMEOUT) {
+        Err(e) => return Remote::GitError(e.to_string()),
+        Ok(o) if !o.status.success() => return Remote::GitError(git_failure(&o)),
+        Ok(_) => {}
+    }
+    // `--local` reads only the repo's own config, so a `remote.origin.url`
+    // set in global or system config cannot masquerade as this repo's
+    // origin.
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(cwd)
-        .args(["config", "--get", "remote.origin.url"]);
-    let out = run_with_timeout(&mut cmd, GIT_TIMEOUT);
-    match out {
+        .args(["config", "--local", "--get", "remote.origin.url"]);
+    match run_with_timeout(&mut cmd, GIT_TIMEOUT) {
         Err(e) => Remote::GitError(e.to_string()),
-        Ok(o) if !o.status.success() => Remote::NoOrigin,
-        Ok(o) => classify_url(String::from_utf8_lossy(&o.stdout).trim()),
+        Ok(o) if o.status.success() => classify_url(String::from_utf8_lossy(&o.stdout).trim()),
+        // In a valid repo (preflight passed), exit 1 with no output is
+        // git-config's "key not set": the repo simply has no origin.
+        Ok(o) if o.status.code() == Some(1) && o.stdout.is_empty() && o.stderr.is_empty() => {
+            Remote::NoOrigin
+        }
+        Ok(o) => Remote::GitError(git_failure(&o)),
+    }
+}
+
+/// The first line of git's stderr, or the exit status when it said nothing.
+fn git_failure(out: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match stderr.lines().next().map(str::trim) {
+        Some(msg) if !msg.is_empty() => msg.to_string(),
+        _ => format!("git exited with {}", out.status),
     }
 }
 
@@ -138,6 +170,112 @@ impl RemoteCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs git in `dir`, asserting success; test fixture setup only.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A fresh git repo in a hermetic temporary directory.
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        dir
+    }
+
+    #[test]
+    fn repo_with_github_origin_classifies_github() {
+        let dir = repo();
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        assert_eq!(
+            remote_for(dir.path()),
+            Remote::GitHub {
+                org: "owner".to_string(),
+                repo: "owner/repo".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn repo_without_origin_is_no_origin() {
+        let dir = repo();
+        assert_eq!(remote_for(dir.path()), Remote::NoOrigin);
+    }
+
+    #[test]
+    fn global_config_origin_does_not_leak_into_repo_without_origin() {
+        let dir = repo();
+        let global = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            global.path(),
+            "[remote \"origin\"]\n\turl = https://github.com/x/y\n",
+        )
+        .unwrap();
+        // `--local` never reads global config, so the env override cannot
+        // change any other test's classification even while briefly set.
+        std::env::set_var("GIT_CONFIG_GLOBAL", global.path());
+        let remote = remote_for(dir.path());
+        std::env::remove_var("GIT_CONFIG_GLOBAL");
+        assert_eq!(remote, Remote::NoOrigin);
+    }
+
+    #[test]
+    fn existing_non_repo_dir_is_git_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(remote_for(dir.path()), Remote::GitError(_)));
+    }
+
+    #[test]
+    fn deleted_cwd_is_git_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("worktree");
+        std::fs::create_dir(&gone).unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        assert!(matches!(remote_for(&gone), Remote::GitError(_)));
+    }
+
+    #[test]
+    fn non_github_origin_is_non_github() {
+        let dir = repo();
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "git@gitlab.com:owner/repo.git"],
+        );
+        assert_eq!(
+            remote_for(dir.path()),
+            Remote::NonGitHub {
+                host: "gitlab.com".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn local_path_origin_is_non_github() {
+        let dir = repo();
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "/srv/repos/mirror.git"],
+        );
+        assert_eq!(
+            remote_for(dir.path()),
+            Remote::NonGitHub {
+                host: "local path".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn classifies_https_github_url() {
