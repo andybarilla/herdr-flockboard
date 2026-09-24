@@ -2,7 +2,10 @@
 //! every subprocess the dashboard spawns (`gh`, `herdr`, `git`) goes through
 //! `run_with_timeout`: a hung command becomes an inline error instead of a
 //! frozen board. Arguments are passed straight to exec — no shell is
-//! involved, so there is no interpolation or injection surface.
+//! involved, so there is no interpolation or injection surface. Stdin is
+//! always `/dev/null`, so no child can read the dashboard's raw-mode
+//! terminal: UI keypresses stay with the TUI and a command that would
+//! prompt sees EOF instead of blocking on interactive input.
 
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
@@ -46,7 +49,9 @@ const TEARDOWN_GRACE: Duration = Duration::from_secs(1);
 /// child), teardown falls back to SIGKILLing the direct child only —
 /// never signaling anything outside our own process group — and every
 /// teardown failure is chained onto the timeout or wait error that
-/// initiated teardown rather than silently dropped.
+/// initiated teardown rather than silently dropped. The child's stdin is
+/// `/dev/null`, never the inherited TUI terminal, so no subprocess can
+/// consume dashboard keypresses or wait for a prompt.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output> {
     run_with(command, timeout, kill_process_group)
 }
@@ -62,6 +67,10 @@ fn run_with(
         // New process group with pgid == child pid, so the whole tree can
         // be signaled without touching unrelated processes.
         .process_group(0)
+        // Never inherit the dashboard's raw-mode terminal: a child
+        // reading stdin would consume UI keypresses or block waiting for
+        // interactive input.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -461,6 +470,82 @@ mod tests {
         let out = run_with_timeout(&mut cmd, Duration::from_secs(5)).unwrap();
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(String::from_utf8(out.stderr).unwrap().trim(), "oops");
+    }
+
+    /// Restores the process's original fd 0 on drop, so the
+    /// stdin-swapping regression test cannot leak its temporary stdin
+    /// into the rest of the test process even when an assertion panics.
+    struct StdinGuard {
+        saved: std::os::unix::io::RawFd,
+    }
+
+    impl StdinGuard {
+        /// Points this process's fd 0 at `file` until the guard drops.
+        fn replace(file: &std::fs::File) -> Self {
+            // SAFETY: dup/dup2 on valid open fds; a failure would corrupt
+            // the whole test process if ignored, so it aborts the test.
+            let saved = unsafe { libc::dup(0) };
+            assert!(saved >= 0, "dup(stdin) failed");
+            let rc = unsafe { libc::dup2(file.as_raw_fd(), 0) };
+            assert!(rc >= 0, "dup2(file, stdin) failed");
+            Self { saved }
+        }
+    }
+
+    impl Drop for StdinGuard {
+        fn drop(&mut self) {
+            // SAFETY: restoring a valid saved fd over fd 0, then closing
+            // the duplicate.
+            unsafe {
+                libc::dup2(self.saved, 0);
+                libc::close(self.saved);
+            }
+        }
+    }
+
+    #[test]
+    fn child_stdin_is_dev_null_never_inherited() {
+        // Regression for the TUI review finding: a child inheriting fd 0
+        // could consume dashboard keypresses or block on interactive
+        // input. Deterministic on ANY harness stdin — including a live
+        // terminal, which this test must never read — by pointing this
+        // process's own fd 0 at a sentinel file for the spawn: an
+        // inherited stdin is then visibly different from /dev/null (the
+        // `-ef` check) and yields the sentinel bytes (the `cat` check),
+        // while a null stdin gives the child immediate EOF. The sentinel
+        // is a regular file, so even a regressed child reads it and
+        // exits promptly — the test can never block on a terminal. fd 0
+        // is process-global, but the swap only spans the run and no other
+        // test reads stdin; the guard restores fd 0 even on panic.
+        let dir = std::env::temp_dir().join(format!(
+            "flockboard-proc-stdin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = TempDir(dir.clone());
+        let sentinel = dir.join("sentinel-stdin");
+        std::fs::write(&sentinel, "sentinel-from-parent-stdin\n").unwrap();
+        let file = std::fs::File::open(&sentinel).unwrap();
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("[ /dev/stdin -ef /dev/null ] || exit 42; [ -z \"$(cat)\" ] || exit 43");
+        let start = Instant::now();
+        let out = {
+            let _guard = StdinGuard::replace(&file);
+            run_with_timeout(&mut cmd, Duration::from_secs(5)).unwrap()
+        };
+        assert!(
+            out.status.success(),
+            "child stdin was inherited or not at EOF: {out:?}"
+        );
+        // EOF is immediate; nowhere near the 5s timeout a blocked read
+        // would hit.
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

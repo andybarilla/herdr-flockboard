@@ -131,6 +131,10 @@ impl GhCli {
     fn run(&self, args: &[&str]) -> Result<String> {
         let mut cmd = Command::new("gh");
         cmd.args(args);
+        // Defense in depth behind the null stdin `run_with_timeout` sets:
+        // the board calls gh unattended, so gh must fail fast on anything
+        // that would prompt rather than ever try to interact.
+        cmd.env("GH_PROMPT_DISABLED", "1");
         let out = run_with_timeout(&mut cmd, GH_TIMEOUT).context("running gh")?;
         if !out.status.success() {
             bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
