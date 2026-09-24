@@ -1,15 +1,18 @@
 //! Dashboard state derivation. Everything here is pure data transformation
-//! over the `herd` and `github` fetch layers — no process spawning, no
-//! terminal — so agent grouping, label bucketing, PR classification, and the
-//! GitHub TTL cache are all unit-testable with fakes.
+//! over the `herd`, `github`, and `journal` fetch layers — no process
+//! spawning, no terminal, no filesystem — so agent grouping, label
+//! bucketing, PR classification, workflow-stage assembly, and the GitHub
+//! TTL cache are all unit-testable with fakes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::git_org::Remote;
 use crate::github::{CheckRollup, Issue, PullRequest};
 use crate::herd::AgentInfo;
+use crate::journal::{self, LiveSet};
 
 /// How often the agent board re-polls `herdr agent list`.
 pub const AGENT_POLL: Duration = Duration::from_secs(3);
@@ -263,17 +266,26 @@ pub struct RepoSlot {
     /// Live agents whose cwd resolves to this slot, aggregated across every
     /// worktree that shares the repo; refreshed on every successful sync.
     pub agent_count: usize,
+    /// Every live cwd that resolves to this slot (main checkout plus any
+    /// worktrees), sorted for deterministic journal reads. The Flock
+    /// journal lives in whichever checkout a supervisor ran in.
+    pub cwds: BTreeSet<PathBuf>,
+    /// The repo's parsed Flock journal, re-read after each successful sync.
+    /// Empty when no live checkout has a readable journal.
+    pub journal: Arc<Vec<journal::Event>>,
     pub issues: Option<Result<Vec<Issue>, String>>,
     pub prs: Option<Result<Vec<PullRequest>, String>>,
     pub fetched_at: Option<Instant>,
 }
 
 impl RepoSlot {
-    fn new(remote: Remote, generation: u64, agent_count: usize) -> Self {
+    fn new(remote: Remote, generation: u64, agent_count: usize, cwds: BTreeSet<PathBuf>) -> Self {
         Self {
             remote,
             generation,
             agent_count,
+            cwds,
+            journal: Arc::new(Vec::new()),
             issues: None,
             prs: None,
             fetched_at: None,
@@ -308,9 +320,9 @@ pub struct SlotCache {
 impl SlotCache {
     /// Reconciles the cache with the live agent set: resolves every live
     /// cwd through `lookup` (a `RemoteCache` in production, so this is a
-    /// map hit after first sight), refreshes per-slot agent counts, prunes
-    /// slots nothing live references anymore, and creates slots for newly
-    /// seen keys with a fresh generation. A cwd reclassified to or from a
+    /// map hit after first sight), refreshes per-slot agent counts and cwd
+    /// sets, prunes slots nothing live references anymore, and creates
+    /// slots for newly seen keys with a fresh generation. A cwd reclassified to or from a
     /// GitHub identity maps to a different key, so its old slot is pruned
     /// and the new one starts empty with a new generation — an in-flight
     /// fetch for the old identity is rejected on writeback. A local cwd
@@ -319,26 +331,30 @@ impl SlotCache {
     /// generation, no cached state) so nothing from the old
     /// classification survives.
     pub fn sync(&mut self, rows: &[AgentRow], lookup: &mut dyn FnMut(&Path) -> Remote) {
-        let mut live: BTreeMap<SlotKey, (Remote, usize)> = BTreeMap::new();
+        let mut live: BTreeMap<SlotKey, (Remote, usize, BTreeSet<PathBuf>)> = BTreeMap::new();
         for row in rows {
             let remote = lookup(&row.cwd);
             let entry = live
                 .entry(SlotKey::for_remote(&row.cwd, &remote))
-                .or_insert_with(|| (remote, 0));
+                .or_insert_with(|| (remote, 0, BTreeSet::new()));
             entry.1 += 1;
+            entry.2.insert(row.cwd.clone());
         }
         self.slots.retain(|key, _| live.contains_key(key));
-        for (key, (remote, count)) in live {
+        for (key, (remote, count, cwds)) in live {
             match self.slots.get_mut(&key) {
-                Some(slot) if slot.remote == remote => slot.agent_count = count,
+                Some(slot) if slot.remote == remote => {
+                    slot.agent_count = count;
+                    slot.cwds = cwds;
+                }
                 Some(slot) => {
                     self.generation += 1;
-                    *slot = RepoSlot::new(remote, self.generation, count);
+                    *slot = RepoSlot::new(remote, self.generation, count, cwds);
                 }
                 None => {
                     self.generation += 1;
                     self.slots
-                        .insert(key, RepoSlot::new(remote, self.generation, count));
+                        .insert(key, RepoSlot::new(remote, self.generation, count, cwds));
                 }
             }
         }
@@ -351,6 +367,20 @@ impl SlotCache {
     /// still renders the herdr error itself from the snapshot.
     pub fn invalidate(&mut self) {
         self.slots.clear();
+    }
+
+    /// Re-reads every GitHub slot's Flock journal from its live checkouts.
+    /// Called after each successful sync: journals are small and the reader
+    /// is tolerant (missing file, truncated tail, unknown events), so a
+    /// fresh read per agent poll keeps stages current without a second
+    /// cache/TTL layer. Non-GitHub slots have no issue/PR surface and are
+    /// skipped.
+    pub fn refresh_journals(&mut self, reader: &dyn Fn(&BTreeSet<PathBuf>) -> Vec<journal::Event>) {
+        for slot in self.slots.values_mut() {
+            if matches!(slot.remote, Remote::GitHub { .. }) {
+                slot.journal = Arc::new(reader(&slot.cwds));
+            }
+        }
     }
 
     /// GitHub slots due for a refetch, as tickets the GitHub worker can
@@ -405,6 +435,82 @@ impl SlotCache {
     }
 }
 
+/// One rendered issue row: the tracker issue plus its derived Flock
+/// workflow stage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueRow {
+    pub number: u64,
+    pub title: String,
+    pub stage: journal::Stage,
+}
+
+/// The open PR that belongs to an issue, if any: an explicit `pr` reference
+/// from the issue's journal events first, then branches named in its
+/// events, then the configured `flock/issue-<n>-<slug>` branch pattern. The
+/// pattern leg is what gives issues with no journal events their inferred
+/// `pr open` stage.
+fn correlated_pr<'a>(
+    number: u64,
+    events: &[journal::Event],
+    prs: Option<&'a [PullRequest]>,
+) -> Option<&'a PullRequest> {
+    let prs = prs?;
+    if let Some(n) = events.iter().filter_map(|e| e.pr).next_back() {
+        if let Some(pr) = prs.iter().find(|p| p.number == n) {
+            return Some(pr);
+        }
+    }
+    for branch in events.iter().filter_map(|e| e.branch.as_deref()) {
+        if let Some(pr) = prs.iter().find(|p| p.head_ref_name == branch) {
+            return Some(pr);
+        }
+    }
+    let prefix = format!("flock/issue-{number}-");
+    prs.iter().find(|p| p.head_ref_name.starts_with(&prefix))
+}
+
+/// Per-issue rows for a repo: each open issue's workflow stage derived from
+/// its journal events, its correlated open PR (checks/mergeability via the
+/// project-config green classifier), and the live agent set. Sorted
+/// active-work-first, then by issue number. `prs` is `None` when PR data
+/// was never fetched or errored — stages then derive from events and
+/// labels alone, same as a missing journal degrades rather than blanks.
+pub fn issue_rows(
+    issues: &[Issue],
+    prs: Option<&[PullRequest]>,
+    events: &[journal::Event],
+    live: &LiveSet,
+) -> Vec<IssueRow> {
+    let mut rows: Vec<IssueRow> = issues
+        .iter()
+        .map(|issue| {
+            let ev: Vec<journal::Event> = events
+                .iter()
+                .filter(|e| e.issue == Some(issue.number))
+                .cloned()
+                .collect();
+            let pr = correlated_pr(issue.number, &ev, prs);
+            let facts = journal::IssueFacts {
+                labels: issue.labels.clone(),
+                events: ev,
+                pr_green: pr.map(|p| journal::classify_green(&p.checks, &p.mergeable)),
+            };
+            IssueRow {
+                number: issue.number,
+                title: issue.title.clone(),
+                stage: journal::derive_stage(&facts, live),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.stage
+            .rank()
+            .cmp(&b.stage.rank())
+            .then_with(|| a.number.cmp(&b.number))
+    });
+    rows
+}
+
 /// What the board renders for one repo: identity, grouping, fetch state.
 pub struct RepoView {
     pub key: String,
@@ -412,11 +518,14 @@ pub struct RepoView {
     pub remote: Remote,
     pub agent_count: usize,
     pub issues: Option<Result<IssueBuckets, String>>,
+    /// Per-issue rows with workflow stages; follows the same fetch-state
+    /// shape as `issues` (None until the first fetch, Err mirrored inline).
+    pub issue_rows: Option<Result<Vec<IssueRow>, String>>,
     pub prs: Option<Result<Vec<PrRow>, String>>,
     pub fetched_at: Option<Instant>,
 }
 
-pub fn repo_view(key: &SlotKey, slot: &RepoSlot) -> RepoView {
+pub fn repo_view(key: &SlotKey, slot: &RepoSlot, live: &LiveSet) -> RepoView {
     // Display name for local states, where no owner/repo identity exists:
     // the full cwd, not the basename. Local slots are keyed by complete
     // path precisely because /a/work and /b/work are unrelated repos, and
@@ -434,6 +543,18 @@ pub fn repo_view(key: &SlotKey, slot: &RepoSlot) -> RepoView {
         Ok(v) => Ok(bucket_issues(v)),
         Err(e) => Err(e.clone()),
     });
+    // PR fetch failures degrade stage derivation to events + labels; they
+    // never blank the issue rows.
+    let prs_ok = slot.prs.as_ref().and_then(|r| r.as_ref().ok());
+    let issue_rows = slot.issues.as_ref().map(|r| match r {
+        Ok(v) => Ok(issue_rows(
+            v,
+            prs_ok.map(Vec::as_slice),
+            &slot.journal,
+            live,
+        )),
+        Err(e) => Err(e.clone()),
+    });
     let prs = slot.prs.as_ref().map(|r| match r {
         Ok(v) => Ok(pr_rows(v)),
         Err(e) => Err(e.clone()),
@@ -444,6 +565,7 @@ pub fn repo_view(key: &SlotKey, slot: &RepoSlot) -> RepoView {
         remote: slot.remote.clone(),
         agent_count: slot.agent_count,
         issues,
+        issue_rows,
         prs,
         fetched_at: slot.fetched_at,
     }
@@ -496,10 +618,16 @@ pub fn dashboard(agents: Result<Vec<AgentRow>, String>, cache: &SlotCache) -> Da
         }
         Ok(rows) => rows,
     };
+    // Herdr liveness is the ground truth behind the journal's advisory
+    // view; it is what lets a died-mid-run issue show as unknown.
+    let live = LiveSet::new(
+        rows.iter().map(|r| (r.workspace.clone(), r.pane.clone())),
+        rows.iter().map(|r| r.cwd.clone()),
+    );
     let views: Vec<RepoView> = cache
         .slots
         .iter()
-        .map(|(key, slot)| repo_view(key, slot))
+        .map(|(key, slot)| repo_view(key, slot, &live))
         .collect();
     Dashboard {
         agents: Ok(rows),
@@ -903,7 +1031,7 @@ mod tests {
         let prs = gh.open_prs(&ticket.repo).map_err(|e| e.to_string());
         // A current-generation completion is accepted.
         assert!(cache.record_fetch(&ticket, issues, prs, Instant::now()));
-        let view = repo_view(&ticket.key, &cache.slots[&ticket.key]);
+        let view = repo_view(&ticket.key, &cache.slots[&ticket.key], &LiveSet::default());
         assert_eq!(view.issues, Some(Err("gh: auth required".to_string())));
         assert_eq!(view.prs, Some(Ok(vec![])));
         assert!(view.fetched_at.is_some());
@@ -965,6 +1093,125 @@ mod tests {
         // distinct, not two identical "work" rows.
         assert_eq!(keys, vec!["/dev/x/work", "/dev/y/work", "/dev/z/broken"]);
         assert_eq!(dash.groups[0].repos[0].key, "/dev/w/mirror (gitlab.com)");
+    }
+
+    fn numbered_issue(number: u64, labels: &[&str]) -> Issue {
+        Issue {
+            number,
+            title: format!("issue {number}"),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn pr_on_branch(number: u64, branch: &str, mergeable: &str) -> PullRequest {
+        PullRequest {
+            number,
+            title: format!("pr {number}"),
+            draft: false,
+            review_decision: String::new(),
+            mergeable: mergeable.to_string(),
+            head_ref_name: branch.to_string(),
+            checks: vec![rollup(Some("COMPLETED"), Some("SUCCESS"), None)],
+        }
+    }
+
+    fn jev(run: &str, event: &str, issue: u64) -> journal::Event {
+        journal::Event {
+            run_id: run.to_string(),
+            workflow: "operator-run".to_string(),
+            event: event.to_string(),
+            issue: Some(issue),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn issue_rows_derive_stages_from_events_labels_and_prs() {
+        let issues = vec![
+            numbered_issue(1, &[]),                  // done via events
+            numbered_issue(2, &[]),                  // pr open via events
+            numbered_issue(3, &["ready-for-agent"]), // queued via label
+            numbered_issue(4, &[]),                  // flock-branch PR, no events
+            numbered_issue(5, &["enhancement"]),     // no signal at all
+        ];
+        let prs = vec![
+            pr_on_branch(20, "flock/issue-2-thing", "UNKNOWN"),
+            pr_on_branch(40, "flock/issue-4-other", "MERGEABLE"),
+        ];
+        let events = vec![
+            jev("r1", "issue_closed", 1),
+            jev("r2", "issue_dispatched", 2),
+            journal::Event {
+                pr: Some(20),
+                ..jev("r2", "pr_opened", 2)
+            },
+        ];
+        let rows = issue_rows(&issues, Some(&prs), &events, &LiveSet::default());
+        let stage = |n: u64| rows.iter().find(|r| r.number == n).unwrap().stage.clone();
+        assert_eq!(stage(1), journal::Stage::Done);
+        // pr_opened seen; the correlated PR's checks are green but
+        // mergeability is unresolved → checks pending.
+        assert_eq!(stage(2), journal::Stage::ChecksPending);
+        assert_eq!(stage(3), journal::Stage::Queued);
+        // No events, but the branch pattern correlates PR #40: green +
+        // mergeable → mergeable, all inferred.
+        assert_eq!(stage(4), journal::Stage::Mergeable);
+        assert_eq!(stage(5), journal::Stage::None);
+        // Active work sorts ahead of dormant rows.
+        assert_eq!(rows[0].number, 2);
+        assert_eq!(rows[1].number, 4);
+    }
+
+    #[test]
+    fn issue_rows_tolerate_missing_pr_data() {
+        let issues = vec![numbered_issue(2, &[])];
+        let events = vec![jev("r1", "pr_opened", 2)];
+        // PR fetch failed or never ran: events still carry the stage.
+        let rows = issue_rows(&issues, None, &events, &LiveSet::default());
+        assert_eq!(rows[0].stage, journal::Stage::PrOpen);
+    }
+
+    #[test]
+    fn issue_rows_mark_died_run_via_live_set() {
+        let issues = vec![numbered_issue(7, &[])];
+        let mut dispatched = jev("r1", "issue_dispatched", 7);
+        dispatched.data = Some(serde_json::json!({"workspace_id": "w1", "pane_id": "w1:p1"}));
+        let events = vec![dispatched];
+        // Agent gone: no terminal event, no live pane → died.
+        let rows = issue_rows(&issues, None, &events, &LiveSet::default());
+        assert_eq!(rows[0].stage, journal::Stage::Died);
+        // Agent live: normal in-flight stage.
+        let live = LiveSet::new(vec![("w1".to_string(), "w1:p1".to_string())], vec![]);
+        let rows = issue_rows(&issues, None, &events, &live);
+        assert_eq!(rows[0].stage, journal::Stage::Dispatched);
+    }
+
+    #[test]
+    fn refresh_journals_reads_only_github_slots() {
+        let rows = agent_rows(vec![
+            info("working", "/dev/a/gh"),
+            info("working", "/dev/a/local"),
+        ]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |cwd: &Path| match cwd.to_str().unwrap() {
+            "/dev/a/gh" => github_remote("o/gh"),
+            _ => Remote::NoOrigin,
+        };
+        cache.sync(&rows, &mut lookup);
+        let reader = |cwds: &BTreeSet<PathBuf>| {
+            assert_eq!(
+                cwds.iter().collect::<Vec<_>>(),
+                vec![Path::new("/dev/a/gh")],
+                "reader sees the slot's live checkouts"
+            );
+            vec![jev("r1", "issue_closed", 3)]
+        };
+        cache.refresh_journals(&reader);
+        let slot = &cache.slots[&github_key("o/gh")];
+        assert_eq!(slot.journal.len(), 1);
+        assert!(slot.cwds.contains(Path::new("/dev/a/gh")));
+        let local = &cache.slots[&SlotKey::Local(PathBuf::from("/dev/a/local"))];
+        assert!(local.journal.is_empty(), "local slots never read journals");
     }
 
     #[test]
