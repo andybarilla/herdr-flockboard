@@ -1,0 +1,31 @@
+id = "andybarilla.flockboard"
+name = "Flockboard"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Live dashboard for Flock-managed agent work: issues, running agents, workflow stage, and what is waiting on you"
+platforms = ["linux", "macos"]
+
+# Fetch the prebuilt binary for this version + platform from the GitHub release
+# (no Rust toolchain needed); falls back to cargo build. `herdr plugin link` skips
+# [[build]] entirely — build a local checkout with `cargo build --release`.
+[[build]]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "dashboard"
+title = "Flockboard"
+placement = "split"
+command = ["bash", "scripts/pane-dashboard.sh"]
+
+[[actions]]
+id = "open-dashboard"
+title = "Open dashboard"
+description = "Open the Flock dashboard in a split pane."
+command = ["bash", "scripts/open-dashboard.sh"]
+
+[[actions]]
+id = "open-dashboard-tab"
+title = "Open dashboard (tab)"
+description = "Open the Flock dashboard in its own tab."
+command = ["bash", "scripts/open-dashboard-tab.sh"]
