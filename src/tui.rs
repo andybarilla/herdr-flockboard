@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::git_org::{Remote, RemoteCache};
 use crate::github::{GhCli, IssueTracker};
 use crate::herd::{HerdCli, HerdControl};
+use crate::inbox::{format_age, InboxItem, InboxKind};
 use crate::journal::{self, Stage};
 use crate::state::{self, AgentStatus, Checks, Dashboard, RepoView, Review, LABEL_PRIORITY};
 
@@ -34,6 +35,11 @@ const MAX_PRS_SHOWN: usize = 8;
 
 /// Issue rows shown per repo before collapsing the tail into "+N more".
 const MAX_ISSUES_SHOWN: usize = 8;
+
+/// Inbox items shown before collapsing the tail into "+N more". The inbox
+/// is the top-priority section, so it gets more rows than a per-repo
+/// table, but a long needs-triage backlog still must not flood the board.
+const MAX_INBOX_SHOWN: usize = 12;
 
 /// How often the GitHub worker checks the slot cache for repos whose TTL
 /// expired; short so a newly seen repo is fetched promptly.
@@ -161,6 +167,7 @@ fn draw(frame: &mut Frame, board: Option<&Dashboard>) {
 fn render(board: &Dashboard) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     render_agents(board, &mut lines);
+    render_inbox(board, &mut lines);
     for group in &board.groups {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -220,6 +227,81 @@ fn render_agents(board: &Dashboard, lines: &mut Vec<Line<'static>>) {
             }
         }
     }
+}
+
+/// The cross-repo "waiting on you" inbox: blocking reviews, parked PRs,
+/// and stopped runs first, then merge-ready PRs, then informational
+/// tracker items — the one section that answers "what needs me right
+/// now". Placed between the agent board and the per-repo groups so the
+/// highest-priority information is on top. A herdr error renders in the
+/// agent section and leaves the inbox empty by construction; claiming
+/// "nothing waiting on you" then would be false, so the section is
+/// skipped entirely on error.
+fn render_inbox(board: &Dashboard, lines: &mut Vec<Line<'static>>) {
+    if board.agents.is_err() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("── WAITING ON YOU ({}) ──", board.inbox.len()),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if board.inbox.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  nothing waiting on you",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return;
+    }
+    for item in board.inbox.iter().take(MAX_INBOX_SHOWN) {
+        lines.push(inbox_line(item));
+    }
+    if board.inbox.len() > MAX_INBOX_SHOWN {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more", board.inbox.len() - MAX_INBOX_SHOWN),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
+fn inbox_line(item: &InboxItem) -> Line<'static> {
+    // Group colors mirror the stage palette: attention red, forward-ready
+    // green, informational yellow.
+    let (symbol, color) = match item.kind.group() {
+        0 => ("!", Color::Red),
+        1 => ("✓", Color::Green),
+        _ => ("?", Color::Yellow),
+    };
+    let age = item
+        .since
+        .map(|t| format!("{} ago", format_age(t.elapsed().unwrap_or(Duration::ZERO))));
+    let reason = item.reason();
+    let reason_color = match item.kind {
+        InboxKind::TrackerInput => Color::Yellow,
+        _ => color,
+    };
+    Line::from(vec![
+        Span::styled(format!(" {symbol}"), Style::default().fg(color)),
+        Span::styled(
+            format!(" {:<24}", truncate(&item.repo, 24)),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw(format!(" {:<8}", item.target.label())),
+        Span::styled(
+            format!(" {:<36}", truncate(&reason, 36)),
+            Style::default().fg(reason_color),
+        ),
+        Span::styled(
+            format!(" {:<9}", age.unwrap_or_default()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(" {}", truncate(&item.title, 50)),
+            Style::default().fg(Color::Gray),
+        ),
+    ])
 }
 
 fn render_repo(repo: &RepoView, lines: &mut Vec<Line<'static>>) {
@@ -671,5 +753,82 @@ mod tests {
         let value: u32 = init_or_rollback(|| Ok(42), || rolled_back.set(true)).unwrap();
         assert_eq!(value, 42);
         assert!(!rolled_back.get());
+    }
+
+    fn inbox_item(kind: InboxKind, target: crate::inbox::Target) -> InboxItem {
+        InboxItem {
+            repo: "o/repo".to_string(),
+            kind,
+            target,
+            title: "the title".to_string(),
+            detail: String::new(),
+            since: None,
+        }
+    }
+
+    #[test]
+    fn empty_inbox_renders_an_explicit_nothing_waiting_state() {
+        let board = Dashboard {
+            agents: Ok(vec![]),
+            groups: vec![],
+            inbox: vec![],
+        };
+        let all: String = render(&board).iter().map(line_text).collect();
+        assert!(all.contains("WAITING ON YOU (0)"));
+        assert!(all.contains("nothing waiting on you"));
+    }
+
+    #[test]
+    fn inbox_items_render_repo_target_reason_age_and_title() {
+        let mut parked = inbox_item(InboxKind::ParkedPr, crate::inbox::Target::Pr(20));
+        parked.detail = "review blocking".to_string();
+        parked.since = Some(std::time::SystemTime::now() - Duration::from_secs(2 * 3600));
+        let board = Dashboard {
+            agents: Ok(vec![]),
+            groups: vec![],
+            inbox: vec![parked],
+        };
+        let lines = render(&board);
+        let all: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(all.iter().any(|t| t.contains("WAITING ON YOU (1)")));
+        let row = all.iter().find(|t| t.contains("PR #20")).expect("item row");
+        assert!(row.contains("o/repo"));
+        assert!(row.contains("parked PR (review blocking)"));
+        assert!(row.contains("2h ago"), "age renders: {row}");
+        assert!(row.contains("the title"));
+        // No empty-state line when there are items.
+        assert!(!all.iter().any(|t| t.contains("nothing waiting on you")));
+    }
+
+    #[test]
+    fn herdr_error_renders_no_inbox_section() {
+        let board = Dashboard {
+            agents: Err("server not running".to_string()),
+            groups: vec![],
+            inbox: vec![],
+        };
+        let all: String = render(&board).iter().map(line_text).collect();
+        assert!(all.contains("herdr unreachable"));
+        // With no live repo set, claiming an empty inbox would be false.
+        assert!(!all.contains("WAITING ON YOU"));
+        assert!(!all.contains("nothing waiting on you"));
+    }
+
+    #[test]
+    fn inbox_tail_collapses_beyond_cap() {
+        let board = Dashboard {
+            agents: Ok(vec![]),
+            groups: vec![],
+            inbox: (1..=(MAX_INBOX_SHOWN + 3) as u64)
+                .map(|n| inbox_item(InboxKind::TrackerInput, crate::inbox::Target::Issue(n)))
+                .collect(),
+        };
+        let all: String = render(&board).iter().map(line_text).collect();
+        assert!(all.contains("+3 more"));
+        assert_eq!(
+            all.matches("the title").count(),
+            MAX_INBOX_SHOWN,
+            "only the capped number of item rows render"
+        );
     }
 }
