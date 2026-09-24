@@ -122,15 +122,19 @@ pub fn read_repo_events(cwds: &BTreeSet<PathBuf>) -> Vec<Event> {
 /// conclusions count as satisfied, and anything unrecognized — a rollup
 /// entry with neither a check-run nor a status-context shape, an unknown
 /// check-run conclusion, an unknown status-context state — is fail-closed:
-/// it classifies as failing, never as merely pending.
+/// it classifies as failing, never as merely pending. `mergeable:
+/// CONFLICTING` is the config's hard-stop `conflict` classification, so
+/// with only three states here it renders as failing/attention rather than
+/// pending; `UNKNOWN` mergeability stays pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrGreen {
     /// `mergeable: MERGEABLE` and every rollup entry satisfied.
     Green,
     /// Nothing failing, but something still running or mergeability
-    /// unresolved.
+    /// unresolved (`UNKNOWN`).
     Pending,
-    /// Any failing/errored entry, or an entry shape we do not recognize.
+    /// Any failing/errored entry, an entry shape we do not recognize, or
+    /// `mergeable: CONFLICTING` (the config's hard-stop `conflict`).
     Failing,
 }
 
@@ -180,6 +184,12 @@ fn check_state(r: &CheckRollup) -> CheckState {
 }
 
 pub fn classify_green(checks: &[CheckRollup], mergeable: &str) -> PrGreen {
+    // A conflict is a hard stop in the project config (`conflict`), not
+    // something merely pending; the three-state UI renders it as the
+    // failing/attention state.
+    if mergeable == "CONFLICTING" {
+        return PrGreen::Failing;
+    }
     if checks.iter().any(|r| check_state(r) == CheckState::Bad) {
         return PrGreen::Failing;
     }
@@ -320,9 +330,10 @@ pub struct IssueFacts {
 
 /// Derives the workflow stage for one issue. Latest event wins; `run_id`
 /// ties events to a run. The precedence is: terminal facts (closed,
-/// stopped) first, then the died heuristic, then the review/rework ladder,
-/// then PR/check progress, then bare dispatch, and finally — with no
-/// usable events at all — label/PR inference.
+/// stopped) first, then a verified merge on the latest run, then the died
+/// heuristic, then the review/rework ladder, then PR/check progress, then
+/// bare dispatch, and finally — with no usable events at all — label/PR
+/// inference.
 pub fn derive_stage(facts: &IssueFacts, live: &LiveSet) -> Stage {
     let events = &facts.events;
     if events.is_empty() {
@@ -337,6 +348,14 @@ pub fn derive_stage(facts: &IssueFacts, live: &LiveSet) -> Stage {
     let run: Vec<&Event> = events.iter().filter(|e| &e.run_id == last_run).collect();
     if let Some(stop) = run.iter().rev().find(|e| e.is("run_stopped")) {
         return Stage::Stopped(stop.reason());
+    }
+    // A verified merge on the latest run is an explicit terminal-adjacent
+    // fact: it outranks the died heuristic (a merged run's agent exiting
+    // is normal, not a death) and needs no clean review verdict — the
+    // merge event speaks for itself. Only `issue_closed` and a latest-run
+    // `run_stopped` (above) outrank it.
+    if run.iter().any(|e| e.is("merge_verified")) {
+        return Stage::Merged;
     }
     // No terminal event for the latest run: if its dispatch named an agent
     // and that agent is gone from herdr, the run likely died. No
@@ -363,15 +382,12 @@ pub fn derive_stage(facts: &IssueFacts, live: &LiveSet) -> Stage {
         match events[v].verdict() {
             Some("blocking") => return Stage::ReviewBlocking,
             Some("clean") => {
-                // Review clean: with `merge_verified` the run is in the
-                // post-merge, pre-close window — no longer "awaiting
-                // merge". Otherwise green checks leave only the operator's
-                // merge/close step; ungreen checks still gate it. With no
-                // PR data to classify, the clean verdict itself is the
-                // freshest known state.
-                if events.iter().any(|e| e.is("merge_verified")) {
-                    return Stage::Merged;
-                }
+                // Review clean (and no `merge_verified` — that is
+                // recognized earlier, before the died heuristic): green
+                // checks leave only the operator's merge/close step;
+                // ungreen checks still gate it. With no PR data to
+                // classify, the clean verdict itself is the freshest
+                // known state.
                 return match facts.pr_green {
                     Some(PrGreen::Green) => Stage::AwaitingMerge,
                     Some(PrGreen::Failing) => Stage::ChecksFailing,
@@ -620,11 +636,38 @@ mod tests {
             classify_green(&[rollup(None, None, Some("EXPECTED"))], "MERGEABLE"),
             PrGreen::Pending
         );
-        // Mergeability unresolved or conflicting → not green.
+        // Mergeability unresolved stays pending; a conflict is the
+        // config's hard-stop `conflict` classification, rendered here as
+        // the failing/attention state.
         assert_eq!(classify_green(&[], "UNKNOWN"), PrGreen::Pending);
-        assert_eq!(classify_green(&[], "CONFLICTING"), PrGreen::Pending);
+        assert_eq!(classify_green(&[], "CONFLICTING"), PrGreen::Failing);
         // No checks at all, mergeable → green (vacuous satisfaction).
         assert_eq!(classify_green(&[], "MERGEABLE"), PrGreen::Green);
+    }
+
+    #[test]
+    fn conflicting_mergeable_is_failing_not_pending() {
+        // Checks otherwise satisfied, but the PR conflicts: the project
+        // config classifies this as the hard stop `conflict`, never as
+        // `pending`, so the three-state UI must show the
+        // failing/attention state rather than "checks pending".
+        assert_eq!(
+            classify_green(
+                &[rollup(Some("COMPLETED"), Some("SUCCESS"), None)],
+                "CONFLICTING"
+            ),
+            PrGreen::Failing
+        );
+        assert_eq!(classify_green(&[], "CONFLICTING"), PrGreen::Failing);
+        // UNKNOWN mergeability stays pending, per the config.
+        assert_eq!(
+            classify_green(
+                &[rollup(Some("COMPLETED"), Some("SUCCESS"), None)],
+                "UNKNOWN"
+            ),
+            PrGreen::Pending
+        );
+        assert_eq!(classify_green(&[], "UNKNOWN"), PrGreen::Pending);
     }
 
     // --- stage derivation from event sequences ---
@@ -763,6 +806,56 @@ mod tests {
         events.push(ev("r1", "issue_closed"));
         f.events = events;
         assert_eq!(derive_stage(&f, &no_live()), Stage::Done);
+    }
+
+    #[test]
+    fn merge_verified_outranks_died_heuristic_regardless_of_verdict() {
+        // Real dispatch data naming a pane/worktree, the supervising agent
+        // gone from herdr, merge verified, issue not yet closed: the
+        // explicit merge event must win over the died heuristic, and must
+        // not require a clean review verdict.
+        let dispatch =
+            serde_json::json!({"workspace_id": "w1", "pane_id": "w1:p1", "worktree": "/wt/7"});
+        let verdicts = [
+            None,
+            Some(serde_json::json!({"verdict": "clean"})),
+            Some(serde_json::json!({"verdict": "blocking"})),
+        ];
+        for verdict in verdicts {
+            let mut events = vec![
+                ev_data("r1", "issue_dispatched", dispatch.clone()),
+                ev("r1", "pr_opened"),
+            ];
+            if let Some(v) = verdict {
+                events.push(ev_data("r1", "review_verdict", v));
+            }
+            events.push(ev("r1", "merge_verified"));
+            assert_eq!(derive_stage(&facts(events), &no_live()), Stage::Merged);
+        }
+    }
+
+    #[test]
+    fn closed_and_stopped_still_outrank_merge_verified() {
+        let dispatch = serde_json::json!({"pane_id": "w1:p1"});
+        let mut events = vec![
+            ev_data("r1", "issue_dispatched", dispatch),
+            ev("r1", "merge_verified"),
+            ev("r1", "issue_closed"),
+        ];
+        assert_eq!(
+            derive_stage(&facts(events.clone()), &no_live()),
+            Stage::Done
+        );
+        events.pop();
+        events.push(ev_data(
+            "r1",
+            "run_stopped",
+            serde_json::json!({"reason": "PR not green"}),
+        ));
+        assert_eq!(
+            derive_stage(&facts(events), &no_live()),
+            Stage::Stopped("PR not green".to_string())
+        );
     }
 
     #[test]
