@@ -4,7 +4,12 @@
 //! here is read-only and fail-tolerant: a missing file, a truncated final
 //! line (crash mid-append), non-UTF-8 bytes in a corrupt tail, unknown event
 //! names (the schema is additive-only), and events from other workflows all
-//! degrade to fewer known facts, never to an error.
+//! degrade to fewer known facts, never to an error. Journals are append-only
+//! and can grow unbounded over a long-lived repo's life, so the reader
+//! retains and parses only the newest `MAX_JOURNAL_EVENTS` lines per file —
+//! enough history that an in-flight issue's events survive (see the
+//! constant), never so much that cached memory or per-poll parse work grows
+//! with the file.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,10 +19,27 @@ use serde::Deserialize;
 use crate::github::CheckRollup;
 use crate::state::LABEL_PRIORITY;
 
+/// Newest journal lines read, parsed, and retained per repo. The journal is
+/// append-only, so the newest events are the file's tail; capping the reader
+/// here keeps every consumer's memory and per-poll parse work flat no matter
+/// how large `.flock/events.jsonl` grows, instead of re-reading the whole
+/// file into the slot cache every agent poll. The bound is deliberately far
+/// above the activity feed's view cap (`feed::MAX_EVENTS_PER_REPO` = 500):
+/// the same cache also backs per-issue stage derivation and the inbox, whose
+/// facts (a parked PR's blocking verdict, a stopped run's reason) can be far
+/// older than the feed's window. 10_000 lines covers hundreds of issue
+/// cycles at a few dozen events each, while worst-case retained memory stays
+/// at a few MB per repo. Residual edge, accepted and documented: an issue
+/// whose *entire* journal history has scrolled past the tail (only possible
+/// after 10_000 newer events in the same repo) loses its event-derived
+/// facts and degrades to label/PR inference — fewer known facts, never an
+/// error, same as every other journal degradation.
+pub const MAX_JOURNAL_EVENTS: usize = 10_000;
+
 /// One parsed journal line. Fields the schema marks optional stay optional;
 /// anything unrecognized (new event names, new `data` shapes) is preserved
 /// but simply never matches a derivation rule. Ordering is by file position
-/// (`parse_events` preserves line order): the journal is append-only, so
+/// (the parser preserves line order): the journal is append-only, so
 /// position order is time order even when a `ts` is malformed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Event {
@@ -78,11 +100,11 @@ impl Event {
     }
 }
 
-/// Parses journal text tolerantly: blank lines and unparseable lines
+/// Parses journal lines tolerantly: blank lines and unparseable lines
 /// (including a truncated final line from a crash mid-append) are skipped,
 /// and unknown event names parse fine — they just match no derivation rule.
-pub fn parse_events(text: &str) -> Vec<Event> {
-    text.lines()
+fn parse_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Event> {
+    lines
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() {
@@ -102,14 +124,29 @@ pub fn parse_events(text: &str) -> Vec<Event> {
         .collect()
 }
 
+/// Parses journal text tolerantly (see `parse_lines`). Test-only: the
+/// production reader goes through `read_file`, which skips the over-bound
+/// head before parsing.
+#[cfg(test)]
+pub fn parse_events(text: &str) -> Vec<Event> {
+    parse_lines(text.lines())
+}
+
 /// Reads one candidate journal file. `None` when the file is missing or
 /// unreadable — an absent journal is a normal state (repo not under Flock
 /// management), not an error. Bytes are decoded lossily: a corrupt tail
 /// with invalid UTF-8 ruins only the line it lands on (the replacement
 /// character makes it unparseable), so every valid prior line survives.
+/// Only the newest `MAX_JOURNAL_EVENTS` lines are parsed and returned: the
+/// head is skipped as whole lines without deserializing, so both retained
+/// memory and per-poll parse work stay bounded as the file grows. (Corrupt
+/// or blank lines inside the tail count toward the line cap, so the event
+/// count can land slightly below it — harmless.)
 fn read_file(path: &Path) -> Option<Vec<Event>> {
     let bytes = std::fs::read(path).ok()?;
-    Some(parse_events(&String::from_utf8_lossy(&bytes)))
+    let text = String::from_utf8_lossy(&bytes);
+    let skip = text.lines().count().saturating_sub(MAX_JOURNAL_EVENTS);
+    Some(parse_lines(text.lines().skip(skip)))
 }
 
 /// Reads the journal for a repo given its live local checkouts. Several
@@ -117,7 +154,8 @@ fn read_file(path: &Path) -> Option<Vec<Event>> {
 /// worktrees), but supervisors only ever write the journal in the checkout
 /// they run in, so the first cwd (in sorted order, for determinism) that
 /// actually has a readable journal wins. No journal anywhere yields no
-/// events, and stages fall back to label/PR inference.
+/// events, and stages fall back to label/PR inference. The result is the
+/// bounded newest tail (`MAX_JOURNAL_EVENTS`), never the whole file.
 pub fn read_repo_events(cwds: &BTreeSet<PathBuf>) -> Vec<Event> {
     cwds.iter()
         .find_map(|cwd| read_file(&cwd.join(".flock").join("events.jsonl")))
@@ -547,6 +585,37 @@ mod tests {
         // Unknown events contribute no stage facts; with nothing else known
         // the issue falls back to inference.
         assert_eq!(derive_stage(&facts(events), &no_live()), Stage::None);
+    }
+
+    #[test]
+    fn reader_retains_only_the_bounded_newest_tail() {
+        // A long-lived repo's journal grows past the reader bound: the
+        // reader parses and returns only the newest MAX_JOURNAL_EVENTS
+        // lines, dropping the file head, so retained memory and per-poll
+        // parse work stay flat no matter how large the file gets.
+        let dir = tempfile::tempdir().unwrap();
+        let flock = dir.path().join(".flock");
+        std::fs::create_dir_all(&flock).unwrap();
+        let total = MAX_JOURNAL_EVENTS + 100;
+        let mut text = String::new();
+        for i in 0..total {
+            let event = if i == total - 1 {
+                "issue_closed"
+            } else {
+                "run_started"
+            };
+            text.push_str(&format!(
+                "{{\"run_id\":\"r{i}\",\"workflow\":\"w\",\"event\":\"{event}\",\"repo\":\"o/r\",\"issue\":1}}\n"
+            ));
+        }
+        std::fs::write(flock.join("events.jsonl"), text).unwrap();
+        let cwds = BTreeSet::from([dir.path().to_path_buf()]);
+        let events = read_repo_events(&cwds);
+        assert_eq!(events.len(), MAX_JOURNAL_EVENTS);
+        // The dropped events are the oldest (the file head); the newest
+        // line of the journal always survives.
+        assert_eq!(events.first().unwrap().run_id, "r100");
+        assert_eq!(events.last().unwrap().event, "issue_closed");
     }
 
     #[test]

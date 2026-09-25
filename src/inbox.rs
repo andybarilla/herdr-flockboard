@@ -487,7 +487,17 @@ pub fn parse_ts(s: &str) -> Option<SystemTime> {
     let y: i64 = dp.next()?.parse().ok()?;
     let m: i64 = dp.next()?.parse().ok()?;
     let d: i64 = dp.next()?.parse().ok()?;
-    if dp.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // Range-check every component before any arithmetic so corrupt
+    // journal input (a huge year, a day of 99) degrades to "no
+    // timestamp" instead of overflowing. RFC3339 years are four
+    // digits, and the epoch result must fit a u64 second count, so
+    // pre-epoch dates degrade the same way — every timestamp gh or a
+    // well-formed journal can emit is far inside that window.
+    if dp.next().is_some()
+        || !(1..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+    {
         return None;
     }
     let (hms, offset) = match time.strip_suffix('Z') {
@@ -496,7 +506,12 @@ pub fn parse_ts(s: &str) -> Option<SystemTime> {
             let idx = time.find(['+', '-'])?;
             let (t, sign) = (&time[..idx], &time[idx..]);
             let (oh, om) = sign[1..].split_once(':')?;
-            let secs: i64 = oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60;
+            let oh: i64 = oh.parse().ok()?;
+            let om: i64 = om.parse().ok()?;
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
+            let secs = oh.checked_mul(3600)?.checked_add(om.checked_mul(60)?)?;
             (t, if sign.starts_with('-') { -secs } else { secs })
         }
     };
@@ -505,24 +520,41 @@ pub fn parse_ts(s: &str) -> Option<SystemTime> {
     let hh: i64 = tp.next()?.parse().ok()?;
     let mm: i64 = tp.next()?.parse().ok()?;
     let ss: i64 = tp.next()?.parse().ok()?;
-    if tp.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+    if tp.next().is_some() || hh > 23 || mm > 59 || ss > 60 || hh < 0 || mm < 0 || ss < 0 {
         return None;
     }
-    let secs = days_from_civil(y, m, d) * 86_400 + hh * 3600 + mm * 60 + ss - offset;
+    // Checked arithmetic throughout: any overflow yields None rather
+    // than panicking in debug builds or wrapping into a bogus SystemTime
+    // in release.
+    let secs = days_from_civil(y, m, d)?
+        .checked_mul(86_400)?
+        .checked_add(hh.checked_mul(3600)?)?
+        .checked_add(mm.checked_mul(60)?)?
+        .checked_add(ss)?
+        .checked_sub(offset)?;
     u64::try_from(secs)
         .ok()
         .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s))
 }
 
 /// Days since the Unix epoch for a Gregorian date (Howard Hinnant's
-/// days-from-civil algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
+/// days-from-civil algorithm). The caller bounds the year to four
+/// digits, which keeps the intermediate products far inside i64; the
+/// checked arithmetic stays as defense-in-depth so no future caller
+/// can overflow it.
+fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
+    let y = if m <= 2 { y.checked_sub(1)? } else { y };
+    let era = y.checked_div_euclid(400)?;
+    let yoe = y.checked_sub(era.checked_mul(400)?)?;
     let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4)?
+        .checked_sub(yoe / 100)?
+        .checked_add(doy)?;
+    era.checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)
 }
 
 #[cfg(test)]
@@ -1226,6 +1258,40 @@ mod tests {
             "2026-13-24T18:52:28Z",
             "2026-09-24T25:52:28Z",
             "2026-09-24T18:52Z",
+        ] {
+            assert_eq!(parse_ts(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_ts_rejects_out_of_range_and_overflowing_components() {
+        // Malformed-but-parseable components must yield None, never an
+        // overflow panic (debug builds) or a wrapped bogus SystemTime
+        // (release builds).
+        for bad in [
+            // Huge year: overflows days-from-civil and the epoch seconds.
+            "999999999-09-24T18:52:28Z",
+            "9999999999999999999-01-01T00:00:00Z",
+            // Pre-epoch dates cannot become a u64 second count.
+            "0000-01-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+            // Month/day out of range.
+            "2026-00-24T18:52:28Z",
+            "2026-99-24T18:52:28Z",
+            "2026-09-00T18:52:28Z",
+            "2026-09-32T18:52:28Z",
+            // Hour/minute/second out of range.
+            "2026-09-24T99:52:28Z",
+            "2026-09-24T18:99:28Z",
+            "2026-09-24T18:52:99Z",
+            // Huge or out-of-range offsets: overflow the i64 multiply,
+            // or exceed the widest real zone.
+            "2026-09-24T18:52:28+9999999999999999999:00",
+            "2026-09-24T18:52:28+24:00",
+            "2026-09-24T18:52:28-99:59",
+            "2026-09-24T18:52:28+02:99",
+            // A valid offset that pushes the instant below the epoch.
+            "1970-01-01T00:00:00+01:00",
         ] {
             assert_eq!(parse_ts(bad), None, "{bad}");
         }

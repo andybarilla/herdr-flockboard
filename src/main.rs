@@ -7,6 +7,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod feed;
 mod git_org;
 mod github;
 mod herd;
