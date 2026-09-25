@@ -431,8 +431,24 @@ fn format_ts(raw: Option<&str>) -> String {
         return "—".to_string();
     };
     if let Some((date, time)) = raw.split_once('T') {
-        if date.len() == 10 && time.len() >= 8 {
-            return format!("{} {}", &date[5..], &time[..8]);
+        // Slice only after validating an ASCII RFC3339-like shape
+        // (YYYY-MM-DD / HH:MM:SS), and then only via `.get()` ranges,
+        // so a malformed multibyte `ts` degrades to the verbatim render
+        // instead of panicking the feed on a non-char-boundary slice.
+        let date_ok = date.len() == 10
+            && date.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                _ => b.is_ascii_digit(),
+            });
+        let time_ok = time.len() >= 8
+            && time.bytes().take(8).enumerate().all(|(i, b)| match i {
+                2 | 5 => b == b':',
+                _ => b.is_ascii_digit(),
+            });
+        if date_ok && time_ok {
+            if let (Some(d), Some(t)) = (date.get(5..), time.get(..8)) {
+                return format!("{d} {t}");
+            }
         }
     }
     truncate(raw, 15)
@@ -1102,7 +1118,26 @@ mod tests {
             "09-24 18:52:28"
         );
         assert_eq!(format_ts(None), "—");
+        // Bare minimum well-formed shape: time of exactly 8 bytes.
+        assert_eq!(format_ts(Some("2026-09-24T18:52:28")), "09-24 18:52:28");
         // A malformed ts renders verbatim, truncated, never as a wrong time.
         assert_eq!(format_ts(Some("not a timestamp")), "not a timestamp");
+    }
+
+    #[test]
+    fn format_ts_tolerates_malformed_and_multibyte_ts() {
+        // Five é before 'T' is a 10-byte, 5-char date: byte-slicing it
+        // at [5..] panics. It must degrade to the verbatim render.
+        assert_eq!(format_ts(Some("éééééT18:52:28")), "éééééT18:52:28");
+        // Multibyte bytes inside the time half also fall back safely.
+        assert_eq!(format_ts(Some("2026-09-24T18:5é:28")), "2026-09-24T18:…");
+        // Boundary lengths: 9-byte date and 7-byte time miss the shape.
+        assert_eq!(format_ts(Some("026-09-24T18:52:28")), "026-09-24T18:5…");
+        assert_eq!(format_ts(Some("2026-09-24T18:52:2")), "2026-09-24T18:…");
+        // Right lengths but wrong separators/digits are not a timestamp.
+        assert_eq!(format_ts(Some("2026/09/24T18:52:28")), "2026/09/24T18:…");
+        assert_eq!(format_ts(Some("2026-09-24T18-52-28")), "2026-09-24T18-…");
+        // A 16-char malformed string truncates with an ellipsis.
+        assert_eq!(format_ts(Some("not a timestamp!")), "not a timestam…");
     }
 }
