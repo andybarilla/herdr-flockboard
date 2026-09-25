@@ -63,7 +63,7 @@ impl Event {
 
     /// `data.verdict` from a `review_verdict` event ("clean"|"blocking"),
     /// verbatim; anything else is tolerated as unknown.
-    fn verdict(&self) -> Option<&str> {
+    pub(crate) fn verdict(&self) -> Option<&str> {
         self.data.as_ref()?.get("verdict")?.as_str()
     }
 

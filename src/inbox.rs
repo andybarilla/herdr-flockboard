@@ -2,8 +2,9 @@
 //! everything that needs the human — blocking reviews, parked PRs, green
 //! PRs awaiting merge, stopped operator runs, and tracker items needing
 //! input. Derivation is pure over the same per-repo facts the repo views
-//! use (tracker issues, open PRs, the Flock event journal via
-//! `journal::derive_stage`, the project-config green classifier), so every
+//! use (tracker issues, open PRs, the Flock event journal — stopped/parked
+//! stages via `journal::derive_stage`, blocking-review verdicts from the
+//! verdict events directly — and the project-config green classifier), so every
 //! category and its clearing condition is unit-testable. Nothing here is
 //! latched: items clear on the next refresh because their condition stops
 //! deriving — a merged or closed PR drops off the open-PR list, a newer
@@ -51,7 +52,9 @@ pub enum InboxKind {
     /// The latest run stopped on a reason that needs human action.
     StoppedRun,
     /// Checks green per the project-config classifier, `MERGEABLE`, no
-    /// blocking review: the human merges per policy.
+    /// blocking review, and no still-unsatisfied required review
+    /// (`reviewDecision: REVIEW_REQUIRED` is `pending` per the project
+    /// config, not green): the human merges per policy.
     AwaitingMerge,
     /// Open issue labeled `needs-info` or `needs-triage`.
     TrackerInput,
@@ -158,16 +161,52 @@ fn needs_human(reason: &str) -> bool {
     !BENIGN_STOPS.contains(&stop_head(reason))
 }
 
+/// The blocking-review fact for one issue, derived from the journal
+/// events directly rather than from `Stage::ReviewBlocking`:
+/// `derive_stage` evaluates its died heuristic before the verdict ladder,
+/// so a latest blocking verdict on a run that later appears dead never
+/// surfaces as a stage — but per the issue it is still a blocking-review
+/// inbox item. Returns the triggering verdict's timestamp when the latest
+/// `review_verdict` is blocking and nothing supersedes it: a newer verdict
+/// (the latest one wins), a `rework_dispatched` or `merge_verified` after
+/// it, or a newer run (the verdict is not in the latest run) all clear it,
+/// mirroring the stage derivation's clearing semantics.
+fn latest_blocking_verdict(events: &[Event]) -> Option<Option<SystemTime>> {
+    let v = events.iter().rposition(|e| e.is("review_verdict"))?;
+    if events[v].verdict() != Some("blocking") {
+        return None;
+    }
+    let superseded = events[v + 1..]
+        .iter()
+        .any(|e| e.is("rework_dispatched") || e.is("merge_verified"));
+    let newer_run = events
+        .last()
+        .is_some_and(|last| last.run_id != events[v].run_id);
+    if superseded || newer_run {
+        return None;
+    }
+    Some(events[v].ts.as_deref().and_then(parse_ts))
+}
+
 /// Derives every inbox item for one repo, sorted by `sort_items` order.
 ///
-/// The journal-derived categories ride `journal::derive_stage` so they
-/// share its precedence and clearing semantics exactly: a blocking verdict
-/// superseded by a rework dispatch, a newer verdict, or a newer run no
-/// longer derives `ReviewBlocking`; a stopped run's item disappears as
-/// soon as a newer run starts (the stage is no longer `Stopped`). A
-/// `review blocking` stop with the PR still open is the parked-PR
-/// category, which subsumes both the blocking-review and the stopped-run
-/// representation of that stop — one row per underlying state.
+/// The stopped-run and parked-PR categories ride `journal::derive_stage`'s
+/// `Stopped` stage, so they share its clearing semantics exactly: a
+/// stopped run's item disappears as soon as a newer run starts (the stage
+/// is no longer `Stopped`). The blocking-review category comes from
+/// `latest_blocking_verdict` (see its doc comment), with the same
+/// supersession rules the stage would apply. A `review blocking` stop
+/// subsumes the blocking-review row for the same verdict — one row per
+/// underlying state — and is the parked-PR category while the PR is still
+/// open.
+///
+/// Journal-derived PR items (blocking review, parked PR) require a
+/// correlated open PR whenever the PR fetch succeeded: a merged or closed
+/// PR drops off the open-PR list and the item clears on the next refresh
+/// rather than lingering as an issue-keyed row or being reclassified as a
+/// stopped run. Only with no PR data at all (fetch never ran or errored)
+/// do they degrade to issue-keyed/stopped-run rows, matching the repo
+/// views' degradation.
 pub fn repo_items(facts: &RepoFacts, live: &LiveSet) -> Vec<InboxItem> {
     let mut items = Vec::new();
     let issues = facts.issues.unwrap_or(&[]);
@@ -192,43 +231,26 @@ pub fn repo_items(facts: &RepoFacts, live: &LiveSet) -> Vec<InboxItem> {
             },
             live,
         );
-        match &stage {
-            Stage::ReviewBlocking => {
-                // The stage guarantees the latest verdict is the blocking
-                // one, so the last review_verdict event is the trigger.
-                let since = events
-                    .iter()
-                    .rev()
-                    .find(|e| e.is("review_verdict"))
-                    .and_then(|e| e.ts.as_deref())
-                    .and_then(parse_ts);
-                let item = match pr {
-                    Some(p) => {
-                        blocked_prs.push(p.number);
-                        make_item(facts.repo, InboxKind::BlockingReview, p, "", since)
-                    }
-                    None => InboxItem {
-                        repo: facts.repo.to_string(),
-                        kind: InboxKind::BlockingReview,
-                        target: Target::Issue(issue.number),
-                        title: issue.title.clone(),
-                        detail: String::new(),
-                        since,
-                    },
-                };
-                items.push(item);
-            }
-            Stage::Stopped(reason) => {
-                let since = events
-                    .iter()
-                    .rev()
-                    .find(|e| e.is("run_stopped"))
-                    .and_then(|e| e.ts.as_deref())
-                    .and_then(parse_ts);
-                if let ("review blocking", Some(p)) = (stop_head(reason), pr) {
-                    // Cycle ended review-blocking and the PR is still open:
-                    // parked per Flock's parked-PR policy. This subsumes the
-                    // stopped-run item for the same stop.
+        // Derived from the verdict events, not the stage: a died run
+        // masks `Stage::ReviewBlocking`, but the verdict is still a
+        // blocking-review inbox item (see `latest_blocking_verdict`).
+        let blocking = latest_blocking_verdict(&events);
+        // A `review blocking` stop subsumes the blocking-review row for
+        // the same verdict (one row per underlying state).
+        let mut review_blocking_stop = false;
+        if let Stage::Stopped(reason) = &stage {
+            let since = events
+                .iter()
+                .rev()
+                .find(|e| e.is("run_stopped"))
+                .and_then(|e| e.ts.as_deref())
+                .and_then(parse_ts);
+            if stop_head(reason) == "review blocking" {
+                review_blocking_stop = true;
+                if let Some(p) = pr {
+                    // Cycle ended review-blocking and the PR is still
+                    // open: parked per Flock's parked-PR policy. This
+                    // subsumes the stopped-run item for the same stop.
                     blocked_prs.push(p.number);
                     items.push(make_item(
                         facts.repo,
@@ -237,7 +259,12 @@ pub fn repo_items(facts: &RepoFacts, live: &LiveSet) -> Vec<InboxItem> {
                         stop_head(reason),
                         since,
                     ));
-                } else if needs_human(reason) {
+                } else if facts.prs.is_none() {
+                    // No PR data at all: degrade to the plain
+                    // stopped-run row. With PR data available and no
+                    // correlated open PR, the parked PR merged or
+                    // closed — the state cleared, and a closed parked
+                    // PR is not reclassified as a stopped run.
                     items.push(InboxItem {
                         repo: facts.repo.to_string(),
                         kind: InboxKind::StoppedRun,
@@ -247,8 +274,40 @@ pub fn repo_items(facts: &RepoFacts, live: &LiveSet) -> Vec<InboxItem> {
                         since,
                     });
                 }
+            } else if needs_human(reason) {
+                items.push(InboxItem {
+                    repo: facts.repo.to_string(),
+                    kind: InboxKind::StoppedRun,
+                    target: Target::Issue(issue.number),
+                    title: issue.title.clone(),
+                    detail: reason.clone(),
+                    since,
+                });
             }
-            _ => {}
+        }
+        if let (Some(since), false) = (blocking, review_blocking_stop) {
+            if let Some(p) = pr {
+                blocked_prs.push(p.number);
+                items.push(make_item(
+                    facts.repo,
+                    InboxKind::BlockingReview,
+                    p,
+                    "",
+                    since,
+                ));
+            } else if facts.prs.is_none() {
+                // No PR data at all: degrade to an issue-keyed row. With
+                // PR data available and no correlated open PR, the PR the
+                // verdict was about merged or closed and the item clears.
+                items.push(InboxItem {
+                    repo: facts.repo.to_string(),
+                    kind: InboxKind::BlockingReview,
+                    target: Target::Issue(issue.number),
+                    title: issue.title.clone(),
+                    detail: String::new(),
+                    since,
+                });
+            }
         }
         if let Some(label) = NEEDS_INPUT_LABELS
             .iter()
@@ -281,12 +340,18 @@ pub fn repo_items(facts: &RepoFacts, live: &LiveSet) -> Vec<InboxItem> {
                     parse_ts(&pr.updated_at),
                 ));
             } else if !pr.draft
+                && pr.review_decision != "REVIEW_REQUIRED"
                 && journal::classify_green(&pr.checks, &pr.mergeable) == PrGreen::Green
             {
                 // Drafts are excluded: a draft is by definition not
-                // awaiting merge. The classifier already excludes
-                // conflicts (CONFLICTING is failing), pending checks, and
-                // unknown shapes (fail-closed).
+                // awaiting merge. REVIEW_REQUIRED means branch protection
+                // still requires a review, which the project config
+                // classifies as `pending`, not green; an empty decision
+                // means no review is required, so only REVIEW_REQUIRED is
+                // excluded here (CHANGES_REQUESTED is the blocking-review
+                // leg above). The classifier already excludes conflicts
+                // (CONFLICTING is failing), pending checks, and unknown
+                // shapes (fail-closed).
                 items.push(make_item(
                     facts.repo,
                     InboxKind::AwaitingMerge,
@@ -581,6 +646,40 @@ mod tests {
         assert_eq!(blocking.len(), 1, "one row for the PR, not one per leg");
     }
 
+    #[test]
+    fn journal_blocking_verdict_clears_when_the_pr_is_merged_or_closed() {
+        let issues = vec![issue(7, &[])];
+        let events = vec![
+            ev("r1", "pr_opened", 7),
+            ev_data(
+                "r1",
+                "review_verdict",
+                7,
+                serde_json::json!({"verdict": "blocking"}),
+            ),
+        ];
+        // Open PR: the item keys on it.
+        let prs = vec![pr(20, "flock/issue-7-thing", "MERGEABLE", "")];
+        let items = repo_items(&facts(Some(&issues), Some(&prs), &events), &no_live());
+        assert_eq!(kinds(&items), vec![InboxKind::BlockingReview]);
+
+        // PR merged/closed (absent from the open list) with PR data
+        // available: the item clears on refresh instead of lingering as
+        // an issue-keyed blocking-review row.
+        let items = repo_items(&facts(Some(&issues), Some(&[]), &events), &no_live());
+        assert!(items.is_empty());
+
+        // With no PR data at all (fetch never ran or errored) the verdict
+        // degrades to an issue-keyed row rather than disappearing.
+        let items = repo_items(&facts(Some(&issues), None, &events), &no_live());
+        let blocking: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == InboxKind::BlockingReview)
+            .collect();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].target, Target::Issue(7));
+    }
+
     // --- parked PRs ---
 
     #[test]
@@ -609,11 +708,14 @@ mod tests {
         // The parked row subsumes the stopped-run item for the same stop.
         assert!(!kinds(&items).contains(&InboxKind::StoppedRun));
 
-        // Clears when the PR is merged/closed (no longer open). The stop
-        // itself still needs a human, so it falls back to a stopped-run
-        // item until a newer run starts.
+        // Clears when the PR is merged/closed (no longer open): a closed
+        // parked PR is done, not reclassified as a stopped run.
         let items = repo_items(&facts(Some(&issues), Some(&[]), &events), &no_live());
-        assert!(!kinds(&items).contains(&InboxKind::ParkedPr));
+        assert!(items.is_empty());
+        // Only with no PR data at all (fetch never ran or errored) does
+        // the stop degrade to a plain stopped-run row until a newer run
+        // starts.
+        let items = repo_items(&facts(Some(&issues), None, &events), &no_live());
         assert_eq!(kinds(&items), vec![InboxKind::StoppedRun]);
     }
 
@@ -678,6 +780,35 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_merge_excludes_review_required() {
+        let issues = vec![];
+        // Green checks, MERGEABLE, not a draft — but branch protection
+        // still requires a review: the project config classifies this as
+        // `pending`, not green, so the PR is not offered as merge-ready
+        // (and it is not a blocking review either).
+        let prs = vec![pr(
+            20,
+            "flock/issue-7-thing",
+            "MERGEABLE",
+            "REVIEW_REQUIRED",
+        )];
+        let items = repo_items(&facts(Some(&issues), Some(&prs), &[]), &no_live());
+        assert!(items.is_empty());
+
+        // An approval, or no required review at all (empty decision),
+        // stays eligible.
+        for decision in ["APPROVED", ""] {
+            let prs = vec![pr(20, "flock/issue-7-thing", "MERGEABLE", decision)];
+            let items = repo_items(&facts(Some(&issues), Some(&prs), &[]), &no_live());
+            assert_eq!(
+                kinds(&items),
+                vec![InboxKind::AwaitingMerge],
+                "reviewDecision {decision:?} stays merge-ready"
+            );
+        }
+    }
+
+    #[test]
     fn awaiting_merge_excluded_when_journal_verdict_blocking() {
         // gh shows no blocking decision, but the journal's latest verdict
         // is blocking: "no blocking review" fails and the PR is not
@@ -696,6 +827,58 @@ mod tests {
         let items = repo_items(&facts(Some(&issues), Some(&prs), &events), &no_live());
         assert!(!kinds(&items).contains(&InboxKind::AwaitingMerge));
         assert!(kinds(&items).contains(&InboxKind::BlockingReview));
+    }
+
+    #[test]
+    fn latest_blocking_verdict_survives_a_died_run() {
+        let issues = vec![issue(7, &[])];
+        let prs = vec![pr(20, "flock/issue-7-thing", "MERGEABLE", "")];
+        let dispatch = serde_json::json!({"workspace_id": "w1", "pane_id": "w1:p1"});
+        let base = || {
+            vec![
+                ev_data("r1", "issue_dispatched", 7, dispatch.clone()),
+                ev("r1", "pr_opened", 7),
+                ev_data(
+                    "r1",
+                    "review_verdict",
+                    7,
+                    serde_json::json!({"verdict": "blocking"}),
+                ),
+            ]
+        };
+        // The run appears dead (its agent is gone from the live set), so
+        // derive_stage yields Died before ever evaluating the verdict —
+        // but the latest blocking verdict is still a blocking-review
+        // inbox item, keyed on the correlated PR and aged from the
+        // verdict event.
+        let items = repo_items(&facts(Some(&issues), Some(&prs), &base()), &no_live());
+        assert_eq!(kinds(&items), vec![InboxKind::BlockingReview]);
+        assert_eq!(items[0].target, Target::Pr(20));
+        assert_eq!(items[0].since, parse_ts("2026-09-24T18:52:28.183Z"));
+
+        // Superseded by a newer clean verdict: the blocking item clears
+        // (the green PR becomes merge-ready instead).
+        let mut events = base();
+        events.push(ev_data(
+            "r1",
+            "review_verdict",
+            7,
+            serde_json::json!({"verdict": "clean"}),
+        ));
+        let items = repo_items(&facts(Some(&issues), Some(&prs), &events), &no_live());
+        assert!(!kinds(&items).contains(&InboxKind::BlockingReview));
+        // ...by a rework dispatched after the verdict...
+        let mut events = base();
+        events.push(ev("r1", "rework_dispatched", 7));
+        let items = repo_items(&facts(Some(&issues), Some(&prs), &events), &no_live());
+        assert!(!kinds(&items).contains(&InboxKind::BlockingReview));
+        // ...or by a newer run (the verdict is no longer in the latest
+        // run, even though that run also appears dead).
+        let mut events = base();
+        events.push(ev("r2", "run_started", 7));
+        events.push(ev_data("r2", "issue_dispatched", 7, dispatch.clone()));
+        let items = repo_items(&facts(Some(&issues), Some(&prs), &events), &no_live());
+        assert!(!kinds(&items).contains(&InboxKind::BlockingReview));
     }
 
     // --- stopped runs ---
