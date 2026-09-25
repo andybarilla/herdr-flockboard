@@ -28,6 +28,10 @@ pub struct Event {
     pub pr: Option<u64>,
     pub branch: Option<String>,
     pub data: Option<serde_json::Value>,
+    /// The event's `ts`, kept verbatim (never used for ordering — file
+    /// position is time order). Consumers parse it leniently; a malformed
+    /// timestamp degrades only their age display.
+    pub ts: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -46,18 +50,20 @@ struct RawEvent {
     branch: Option<String>,
     #[serde(default)]
     data: Option<serde_json::Value>,
-    // `v` and `ts` are tool-generated metadata; the reader keys ordering off
-    // file position and tolerates any schema version, so neither is kept.
+    #[serde(default)]
+    ts: Option<String>,
+    // `v` is tool-generated metadata and never read; the reader tolerates
+    // any schema version.
 }
 
 impl Event {
-    fn is(&self, name: &str) -> bool {
+    pub(crate) fn is(&self, name: &str) -> bool {
         self.event == name
     }
 
     /// `data.verdict` from a `review_verdict` event ("clean"|"blocking"),
     /// verbatim; anything else is tolerated as unknown.
-    fn verdict(&self) -> Option<&str> {
+    pub(crate) fn verdict(&self) -> Option<&str> {
         self.data.as_ref()?.get("verdict")?.as_str()
     }
 
@@ -90,6 +96,7 @@ pub fn parse_events(text: &str) -> Vec<Event> {
                 pr: r.pr,
                 branch: r.branch,
                 data: r.data,
+                ts: r.ts,
             })
         })
         .collect()
@@ -490,6 +497,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].pr, Some(5));
         assert_eq!(events[1].branch.as_deref(), Some("flock/issue-1-x"));
+        assert_eq!(events[1].ts.as_deref(), Some("2026-09-24T19:05:01.524Z"));
         assert!(events[1].data.is_some());
     }
 

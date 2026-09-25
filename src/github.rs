@@ -19,6 +19,10 @@ pub struct Issue {
     pub number: u64,
     pub title: String,
     pub labels: Vec<String>,
+    /// RFC3339 `updatedAt` from gh. gh's list payload has no per-label
+    /// timestamp, so this is the closest available age basis for
+    /// label-driven inbox items.
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +39,9 @@ pub struct PullRequest {
     /// Head branch name; correlates a PR back to its issue via the
     /// `flock/issue-<n>-<slug>` branch pattern and journal `branch` fields.
     pub head_ref_name: String,
+    /// RFC3339 `updatedAt` from gh; the age basis for PR-state inbox items
+    /// (no per-review timestamp is available in the list payload).
+    pub updated_at: String,
     pub checks: Vec<CheckRollup>,
 }
 
@@ -61,6 +68,8 @@ struct RawIssue {
     title: String,
     #[serde(default)]
     labels: Vec<RawLabel>,
+    #[serde(default, rename = "updatedAt")]
+    updated_at: String,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +91,8 @@ struct RawPr {
     mergeable: String,
     #[serde(default)]
     head_ref_name: String,
+    #[serde(default)]
+    updated_at: String,
     // gh emits `null` (not `[]`) for a PR with no checks at all.
     #[serde(default)]
     status_check_rollup: Option<Vec<RawRollup>>,
@@ -105,6 +116,7 @@ pub fn parse_issues(json: &str) -> Result<Vec<Issue>> {
             number: r.number,
             title: r.title,
             labels: r.labels.into_iter().map(|l| l.name).collect(),
+            updated_at: r.updated_at,
         })
         .collect())
 }
@@ -120,6 +132,7 @@ pub fn parse_prs(json: &str) -> Result<Vec<PullRequest>> {
             review_decision: r.review_decision,
             mergeable: r.mergeable,
             head_ref_name: r.head_ref_name,
+            updated_at: r.updated_at,
             checks: r
                 .status_check_rollup
                 .unwrap_or_default()
@@ -165,7 +178,7 @@ impl IssueTracker for GhCli {
             "--state",
             "open",
             "--json",
-            "number,title,labels",
+            "number,title,labels,updatedAt",
             "--limit",
             "200",
         ])?;
@@ -181,7 +194,7 @@ impl IssueTracker for GhCli {
             "--state",
             "open",
             "--json",
-            "number,title,isDraft,reviewDecision,mergeable,headRefName,statusCheckRollup",
+            "number,title,isDraft,reviewDecision,mergeable,headRefName,updatedAt,statusCheckRollup",
             "--limit",
             "200",
         ])?;
@@ -220,20 +233,22 @@ mod tests {
     #[test]
     fn parses_issues_with_labels() {
         let json = r#"[
-            {"number": 1, "title": "Board", "labels": [{"name": "enhancement"}, {"name": "ready-for-agent"}]},
+            {"number": 1, "title": "Board", "labels": [{"name": "enhancement"}, {"name": "ready-for-agent"}], "updatedAt": "2026-09-24T18:52:28Z"},
             {"number": 2, "title": "No labels", "labels": []}
         ]"#;
         let issues = parse_issues(json).unwrap();
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].labels, vec!["enhancement", "ready-for-agent"]);
+        assert_eq!(issues[0].updated_at, "2026-09-24T18:52:28Z");
         assert!(issues[1].labels.is_empty());
+        assert!(issues[1].updated_at.is_empty());
     }
 
     #[test]
     fn parses_prs_with_both_check_shapes() {
         let json = r#"[
             {"number": 7, "title": "Fix", "isDraft": false, "reviewDecision": "APPROVED",
-             "mergeable": "MERGEABLE", "headRefName": "flock/issue-7-fix",
+             "mergeable": "MERGEABLE", "headRefName": "flock/issue-7-fix", "updatedAt": "2026-09-24T19:05:01Z",
              "statusCheckRollup": [
                 {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "name": "test"},
                 {"__typename": "StatusContext", "state": "PENDING", "context": "ci"}
@@ -245,6 +260,7 @@ mod tests {
         assert_eq!(prs[0].review_decision, "APPROVED");
         assert_eq!(prs[0].mergeable, "MERGEABLE");
         assert_eq!(prs[0].head_ref_name, "flock/issue-7-fix");
+        assert_eq!(prs[0].updated_at, "2026-09-24T19:05:01Z");
         assert_eq!(
             prs[0].checks,
             vec![

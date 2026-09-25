@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 mod git_org;
 mod github;
 mod herd;
+mod inbox;
 mod journal;
 mod proc;
 mod state;

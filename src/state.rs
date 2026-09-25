@@ -1,8 +1,8 @@
 //! Dashboard state derivation. Everything here is pure data transformation
 //! over the `herd`, `github`, and `journal` fetch layers — no process
 //! spawning, no terminal, no filesystem — so agent grouping, label
-//! bucketing, PR classification, workflow-stage assembly, and the GitHub
-//! TTL cache are all unit-testable with fakes.
+//! bucketing, PR classification, workflow-stage assembly, cross-repo inbox
+//! aggregation, and the GitHub TTL cache are all unit-testable with fakes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::git_org::Remote;
 use crate::github::{CheckRollup, Issue, PullRequest};
 use crate::herd::AgentInfo;
+use crate::inbox::{self, InboxItem};
 use crate::journal::{self, LiveSet};
 
 /// How often the agent board re-polls `herdr agent list`.
@@ -501,8 +502,9 @@ pub struct IssueRow {
 /// from the issue's journal events first, then branches named in its
 /// events, then the configured `flock/issue-<n>-<slug>` branch pattern. The
 /// pattern leg is what gives issues with no journal events their inferred
-/// `pr open` stage.
-fn correlated_pr<'a>(
+/// `pr open` stage. Shared with the inbox derivation, which keys
+/// PR-state categories off the same correlation.
+pub(crate) fn correlated_pr<'a>(
     number: u64,
     events: &[journal::Event],
     prs: Option<&'a [PullRequest]>,
@@ -659,6 +661,9 @@ pub fn group_repos(views: Vec<RepoView>) -> Vec<OrgGroup> {
 pub struct Dashboard {
     pub agents: Result<Vec<AgentRow>, String>,
     pub groups: Vec<OrgGroup>,
+    /// The cross-repo "waiting on you" inbox, priority-sorted. Empty on a
+    /// herdr error: with no live repo set there is nothing to derive from.
+    pub inbox: Vec<InboxItem>,
 }
 
 pub fn dashboard(agents: Result<Vec<AgentRow>, String>, cache: &SlotCache) -> Dashboard {
@@ -667,6 +672,7 @@ pub fn dashboard(agents: Result<Vec<AgentRow>, String>, cache: &SlotCache) -> Da
             return Dashboard {
                 agents: Err(e),
                 groups: Vec::new(),
+                inbox: Vec::new(),
             }
         }
         Ok(rows) => rows,
@@ -682,9 +688,34 @@ pub fn dashboard(agents: Result<Vec<AgentRow>, String>, cache: &SlotCache) -> Da
         .iter()
         .map(|(key, slot)| repo_view(key, slot, &live))
         .collect();
+    // The inbox aggregates every discovered GitHub repo; unfetched or
+    // errored per-repo data degrades to the categories that do not need
+    // it, same as the repo views.
+    let mut inbox = Vec::new();
+    for slot in cache.slots.values() {
+        if let Remote::GitHub { repo, .. } = &slot.remote {
+            inbox.extend(inbox::repo_items(
+                &inbox::RepoFacts {
+                    repo,
+                    issues: slot
+                        .issues
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok().map(Vec::as_slice)),
+                    prs: slot
+                        .prs
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok().map(Vec::as_slice)),
+                    events: &slot.journal,
+                },
+                &live,
+            ));
+        }
+    }
+    inbox::sort_items(&mut inbox);
     Dashboard {
         agents: Ok(rows),
         groups: group_repos(views),
+        inbox,
     }
 }
 
@@ -710,6 +741,7 @@ mod tests {
             number: 1,
             title: "t".to_string(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            updated_at: String::new(),
         }
     }
 
@@ -1222,6 +1254,7 @@ mod tests {
             number,
             title: format!("issue {number}"),
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            updated_at: String::new(),
         }
     }
 
@@ -1233,6 +1266,7 @@ mod tests {
             review_decision: String::new(),
             mergeable: mergeable.to_string(),
             head_ref_name: branch.to_string(),
+            updated_at: String::new(),
             checks: vec![rollup(Some("COMPLETED"), Some("SUCCESS"), None)],
         }
     }
@@ -1355,5 +1389,56 @@ mod tests {
         let dash = dashboard(Ok(vec![]), &SlotCache::default());
         assert!(dash.agents.unwrap().is_empty());
         assert!(dash.groups.is_empty());
+        assert!(dash.inbox.is_empty());
+    }
+
+    #[test]
+    fn dashboard_aggregates_inbox_across_slots_and_error_clears_it() {
+        let t0 = Instant::now();
+        let rows = agent_rows(vec![info("working", "/dev/a/one")]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(&rows, &mut lookup, t0);
+        // Issue 7: latest verdict blocking. Issue 8: stopped on a benign
+        // reason (no inbox item). Issue 9: needs-info.
+        cache.refresh_journals(&|_| {
+            vec![
+                journal::Event {
+                    data: Some(serde_json::json!({"verdict": "blocking"})),
+                    ..jev("r1", "review_verdict", 7)
+                },
+                journal::Event {
+                    data: Some(serde_json::json!({"reason": "queue empty"})),
+                    ..jev("r2", "run_stopped", 8)
+                },
+            ]
+        });
+        let ticket = due_ticket(&cache, "o/one", t0);
+        assert!(cache.record_fetch(
+            &ticket,
+            Ok(vec![
+                numbered_issue(7, &[]),
+                numbered_issue(8, &[]),
+                numbered_issue(9, &["needs-info"]),
+            ]),
+            Ok(vec![pr_on_branch(20, "flock/issue-7-thing", "MERGEABLE")]),
+            t0,
+        ));
+        let dash = dashboard(Ok(rows.clone()), &cache);
+        let kinds: Vec<_> = dash.inbox.iter().map(|i| i.kind).collect();
+        // Blocking review (PR #20) first, then the informational item;
+        // the benign stop derived nothing.
+        assert_eq!(
+            kinds,
+            vec![
+                inbox::InboxKind::BlockingReview,
+                inbox::InboxKind::TrackerInput,
+            ]
+        );
+        assert!(dash.inbox.iter().all(|i| i.repo == "o/one"));
+        // A herdr failure invalidates the live repo set: no inbox either.
+        cache.invalidate();
+        let dash = dashboard(Err("server not running".to_string()), &cache);
+        assert!(dash.inbox.is_empty());
     }
 }

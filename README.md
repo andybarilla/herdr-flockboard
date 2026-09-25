@@ -5,13 +5,22 @@ agent work: open issues by workflow state, which agents are running and where
 each issue is in its workflow, and what is waiting on the human — across every
 repo active in the herdr session.
 
-Status: **workflow stage board**. The dashboard TUI shows every agent in the
-herdr session with its status, plus per-repo open issues by Flock state label
-— each with its derived workflow stage (dispatched, pr open, checks pending/
-failing, mergeable, review clean/blocking, rework in progress, awaiting
-merge, merged, done, stopped, or died-mid-run unknown) — and open PRs with
-check/review state, grouped by git-origin organization. Read-only; the
-waiting-on-me inbox is still a roadmap item (below).
+Status: **waiting-on-you inbox**. The dashboard TUI shows every agent in
+the herdr session with its status, plus per-repo open issues by Flock state
+label — each with its derived workflow stage (dispatched, pr open, checks
+pending/failing, mergeable, review clean/blocking, rework in progress,
+avaiting merge, merged, done, stopped, or died-mid-run unknown) — and open
+PRs with check/review state, grouped by git-origin organization. A
+prioritized **waiting on you** inbox sits above the repo sections and
+aggregates everything that needs the human across every discovered repo:
+blocking reviews (latest journal verdict blocking, or gh
+`CHANGES_REQUESTED`), parked PRs (cycle ended `review blocking`, PR still
+open), green PRs awaiting merge (per the project-config green classifier),
+stopped operator runs whose reason needs human action, and open issues
+labeled `needs-info`/`needs-triage`. Each item names its repo, issue/PR,
+reason, and age; blocking/stopped items sort first, then merge-ready, then
+informational; an empty inbox says so explicitly, and items clear on the
+next refresh as their condition resolves. Read-only.
 
 ## Install
 
@@ -92,8 +101,8 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
 1. ~~Scaffold: Cargo project, plugin manifest, build/install/link scripts, CI.~~
 2. ~~Live status board: agents + per-repo issues/PRs, read-only.~~
 3. ~~Per-issue workflow stage view (reads the Flock event journal).~~
-4. "Waiting on me" inbox: blocking reviews, parked PRs, stopped runs,
-   needs-info items.
+4. ~~"Waiting on me" inbox: blocking reviews, parked PRs, stopped runs,
+   needs-info items.~~
 5. Cross-repo activity feed (scuttlebutt-style).
 
 ## Development
