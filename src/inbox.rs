@@ -139,7 +139,8 @@ impl InboxItem {
 /// Everything the inbox derivation knows about one repo: its open issues
 /// and PRs (`None` when that fetch never ran or errored — GitHub-state
 /// categories then simply derive nothing, same degradation as the repo
-/// views) and its parsed journal events.
+/// views; journal blocking facts still gate merge-ready PRs when only the
+/// issue fetch failed, see `repo_items`) and its parsed journal events.
 pub struct RepoFacts<'a> {
     /// "owner/name".
     pub repo: &'a str,
@@ -207,6 +208,15 @@ fn latest_blocking_verdict(events: &[Event]) -> Option<Option<SystemTime>> {
 /// stopped run. Only with no PR data at all (fetch never ran or errored)
 /// do they degrade to issue-keyed/stopped-run rows, matching the repo
 /// views' degradation.
+///
+/// When the issue fetch failed but PR data is available, the per-issue
+/// loop below never runs, so its journal-derived blocking facts would be
+/// lost and a green PR the journal says is blocked could surface as
+/// awaiting merge. A fallback pass re-derives just those facts straight
+/// from the journal — events carry issue/pr/branch keys independently of
+/// the issue fetch — and adds each correlated open PR to `blocked_prs`
+/// before the PR-state pass (suppression only; no rows are emitted in
+/// this degraded mode).
 pub fn repo_items(facts: &RepoFacts, live: &LiveSet) -> Vec<InboxItem> {
     let mut items = Vec::new();
     let issues = facts.issues.unwrap_or(&[]);
@@ -321,6 +331,50 @@ pub fn repo_items(facts: &RepoFacts, live: &LiveSet) -> Vec<InboxItem> {
                 detail: label.to_string(),
                 since: parse_ts(&issue.updated_at),
             });
+        }
+    }
+
+    // Issue fetch failed but PR data is available: the issue loop above
+    // never ran, so journal-derived blocking facts would be lost and a
+    // green PR the journal says is blocked could surface as awaiting
+    // merge. Re-derive just those facts per journal issue cluster — the
+    // same verdict/stop rules as the issue loop — and push each
+    // correlated open PR onto `blocked_prs` before the PR-state pass.
+    if facts.issues.is_none() && facts.prs.is_some() {
+        let mut numbers: Vec<u64> = facts.events.iter().filter_map(|e| e.issue).collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        for number in numbers {
+            let events: Vec<Event> = facts
+                .events
+                .iter()
+                .filter(|e| e.issue == Some(number))
+                .cloned()
+                .collect();
+            let Some(pr) = correlated_pr(number, &events, facts.prs) else {
+                // No correlated open PR: merged/closed (cleared) or not
+                // yet opened — nothing to suppress.
+                continue;
+            };
+            let verdict_blocking = latest_blocking_verdict(&events).is_some();
+            // Same stop semantics as the issue loop: a latest-run
+            // `review blocking` stop parks a still-open PR. Labels are
+            // unavailable without the issue fetch, but they never feed
+            // the Stopped stage.
+            let parked = matches!(
+                journal::derive_stage(
+                    &journal::IssueFacts {
+                        labels: Vec::new(),
+                        events,
+                        pr_green: None,
+                    },
+                    live,
+                ),
+                Stage::Stopped(reason) if stop_head(&reason) == "review blocking"
+            );
+            if (verdict_blocking || parked) && !blocked_prs.contains(&pr.number) {
+                blocked_prs.push(pr.number);
+            }
         }
     }
 
@@ -1047,6 +1101,100 @@ mod tests {
         )];
         let items = repo_items(&facts(Some(&issues), None, &events), &no_live());
         assert_eq!(kinds(&items), vec![InboxKind::StoppedRun]);
+    }
+
+    // --- issue fetch failed: journal blocking facts still gate merge-ready ---
+
+    #[test]
+    fn unfetched_issues_do_not_unlock_a_journal_blocked_pr() {
+        // Issue fetch failed (issues=None) but PR data is available and
+        // the journal's latest verdict is blocking: the green PR must not
+        // be offered as merge-ready (the spec's "no blocking review" gate
+        // cannot depend on the issue fetch succeeding).
+        let prs = vec![pr(20, "flock/issue-7-thing", "MERGEABLE", "APPROVED")];
+        let events = vec![
+            ev("r1", "pr_opened", 7),
+            ev_data(
+                "r1",
+                "review_verdict",
+                7,
+                serde_json::json!({"verdict": "blocking"}),
+            ),
+        ];
+        let items = repo_items(&facts(None, Some(&prs), &events), &no_live());
+        assert!(!kinds(&items).contains(&InboxKind::AwaitingMerge));
+
+        // Correlation rides the events' own pr/branch fields too, not
+        // just the flock/issue-<n>- branch pattern.
+        let prs = vec![pr(20, "feature/other", "MERGEABLE", "APPROVED")];
+        let mut opened = ev("r1", "pr_opened", 7);
+        opened.pr = Some(20);
+        let events = vec![
+            opened,
+            ev_data(
+                "r1",
+                "review_verdict",
+                7,
+                serde_json::json!({"verdict": "blocking"}),
+            ),
+        ];
+        let items = repo_items(&facts(None, Some(&prs), &events), &no_live());
+        assert!(!kinds(&items).contains(&InboxKind::AwaitingMerge));
+    }
+
+    #[test]
+    fn unfetched_issues_do_not_unlock_a_parked_pr() {
+        // Same degraded fetch, but the blocking signal is a parked
+        // `review blocking` stop: the still-open PR is not merge-ready.
+        let prs = vec![pr(20, "flock/issue-7-thing", "MERGEABLE", "APPROVED")];
+        let events = vec![
+            ev("r1", "pr_opened", 7),
+            ev_data(
+                "r1",
+                "run_stopped",
+                7,
+                serde_json::json!({"reason": "review blocking: 2 findings on PR #20"}),
+            ),
+        ];
+        let items = repo_items(&facts(None, Some(&prs), &events), &no_live());
+        assert!(!kinds(&items).contains(&InboxKind::AwaitingMerge));
+
+        // A newer run supersedes the stop in stage derivation, so the
+        // suppression clears with it.
+        let mut events = events;
+        events.push(ev("r2", "run_started", 7));
+        events.push(ev("r2", "issue_dispatched", 7));
+        let items = repo_items(&facts(None, Some(&prs), &events), &no_live());
+        assert_eq!(kinds(&items), vec![InboxKind::AwaitingMerge]);
+    }
+
+    #[test]
+    fn unfetched_issues_superseded_verdict_stays_merge_ready() {
+        // The same supersession rules as the issue-loop path apply: a
+        // blocking verdict that is no longer the operative state does not
+        // suppress the merge-ready row.
+        let prs = vec![pr(20, "flock/issue-7-thing", "MERGEABLE", "APPROVED")];
+        let verdict =
+            |v: &str| ev_data("r1", "review_verdict", 7, serde_json::json!({"verdict": v}));
+        let base = || vec![ev("r1", "pr_opened", 7), verdict("blocking")];
+
+        // Superseded by a newer clean verdict...
+        let mut events = base();
+        events.push(verdict("clean"));
+        let items = repo_items(&facts(None, Some(&prs), &events), &no_live());
+        assert_eq!(kinds(&items), vec![InboxKind::AwaitingMerge]);
+        // ...by a rework dispatched after the verdict...
+        let mut events = base();
+        events.push(ev("r1", "rework_dispatched", 7));
+        let items = repo_items(&facts(None, Some(&prs), &events), &no_live());
+        assert_eq!(kinds(&items), vec![InboxKind::AwaitingMerge]);
+        // ...or by a newer run (the verdict is no longer in the latest
+        // run).
+        let mut events = base();
+        events.push(ev("r2", "run_started", 7));
+        events.push(ev("r2", "issue_dispatched", 7));
+        let items = repo_items(&facts(None, Some(&prs), &events), &no_live());
+        assert_eq!(kinds(&items), vec![InboxKind::AwaitingMerge]);
     }
 
     // --- timestamps and ages ---
