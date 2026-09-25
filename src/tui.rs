@@ -19,6 +19,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::feed::{self, FeedEvent};
 use crate::git_org::{Remote, RemoteCache};
 use crate::github::{GhCli, IssueTracker};
 use crate::herd::{HerdCli, HerdControl};
@@ -40,6 +41,12 @@ const MAX_ISSUES_SHOWN: usize = 8;
 /// is the top-priority section, so it gets more rows than a per-repo
 /// table, but a long needs-triage backlog still must not flood the board.
 const MAX_INBOX_SHOWN: usize = 12;
+
+/// Activity-feed events shown before collapsing the tail into "+N more".
+/// The feed is a rolling stream, so a busy session would otherwise push
+/// the repo sections off the screen; the full bounded window per repo
+/// still lives in `board.feed`.
+const MAX_FEED_SHOWN: usize = 10;
 
 /// How often the GitHub worker checks the slot cache for repos whose TTL
 /// expired; short so a newly seen repo is fetched promptly.
@@ -67,19 +74,39 @@ pub fn run() -> Result<()> {
 
     let mut guard = TerminalGuard::new()?;
     let mut board: Option<Dashboard> = None;
+    // Activity-feed repo filter: `None` is "all". Session state of the
+    // pane, kept across snapshots — the board itself is rebuilt from the
+    // journals on every poll, so the filter lives here.
+    let mut feed_filter: Option<String> = None;
     loop {
         // Keep only the freshest snapshot; the worker outpaces the UI when
         // GitHub is slow.
         while let Ok(d) = rx.try_recv() {
             board = Some(d);
         }
-        guard.terminal.draw(|frame| draw(frame, board.as_ref()))?;
+        guard.terminal.draw(|frame| {
+            draw(frame, board.as_ref(), feed_filter.as_deref());
+        })?;
         if event::poll(UI_TICK)? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
+                    }
+                    // Cycle the feed filter: all → each repo on the board
+                    // → all.
+                    KeyCode::Char('f') => {
+                        if let Some(b) = &board {
+                            let mut repos: Vec<String> = b
+                                .groups
+                                .iter()
+                                .flat_map(|g| g.repos.iter().map(|r| r.key.clone()))
+                                .collect();
+                            repos.sort();
+                            repos.dedup();
+                            feed_filter = next_filter(&feed_filter, &repos);
+                        }
                     }
                     _ => {}
                 }
@@ -112,7 +139,8 @@ fn agent_loop(tx: mpsc::Sender<Dashboard>, slots: SharedSlots) {
                 Ok(rows) => {
                     slots.sync(rows, &mut |cwd| remotes.get(cwd), Instant::now());
                     // Journals are tiny and the reader is tolerant, so a
-                    // fresh read each poll keeps issue stages current.
+                    // fresh read each poll keeps issue stages and the
+                    // activity feed current.
                     slots.refresh_journals(&journal::read_repo_events);
                 }
                 Err(_) => slots.invalidate(),
@@ -145,16 +173,16 @@ fn github_loop(slots: SharedSlots) {
     }
 }
 
-fn draw(frame: &mut Frame, board: Option<&Dashboard>) {
+fn draw(frame: &mut Frame, board: Option<&Dashboard>, feed_filter: Option<&str>) {
     let lines = match board {
         None => vec![Line::from(Span::styled(
             "connecting to herdr…",
             Style::default().fg(Color::DarkGray),
         ))],
-        Some(b) => render(b),
+        Some(b) => render(b, feed_filter),
     };
     let title = format!(
-        " Flockboard — q quit · agents every {}s · github every {}s ",
+        " Flockboard — q quit · f filter feed · agents every {}s · github every {}s ",
         state::AGENT_POLL.as_secs(),
         state::GH_TTL.as_secs(),
     );
@@ -164,10 +192,11 @@ fn draw(frame: &mut Frame, board: Option<&Dashboard>) {
     );
 }
 
-fn render(board: &Dashboard) -> Vec<Line<'static>> {
+fn render(board: &Dashboard, feed_filter: Option<&str>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     render_agents(board, &mut lines);
     render_inbox(board, &mut lines);
+    render_feed(board, &mut lines, feed_filter);
     for group in &board.groups {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -302,6 +331,124 @@ fn inbox_line(item: &InboxItem) -> Line<'static> {
             Style::default().fg(Color::Gray),
         ),
     ])
+}
+
+/// The cross-repo activity feed: workflow events from every discovered
+/// repo's Flock journal, newest first by event timestamp. Placed between
+/// the inbox and the per-repo groups: below the "what needs me" summary,
+/// above the detail. The `f` key cycles a per-repo filter (including
+/// "all") that persists for the pane session. Skipped entirely on a
+/// herdr error, like the inbox: with no live repo set there is nothing
+/// to feed from, and claiming "no events yet" would be false.
+fn render_feed(board: &Dashboard, lines: &mut Vec<Line<'static>>, filter: Option<&str>) {
+    if board.agents.is_err() {
+        return;
+    }
+    let shown = feed::filter_repo(&board.feed, filter);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("── ACTIVITY ({}) ──", filter.unwrap_or("all repos")),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if shown.is_empty() {
+        let msg = match filter {
+            Some(repo) => format!("  no journal events for {repo}"),
+            None => "  no journal events yet".to_string(),
+        };
+        lines.push(Line::from(Span::styled(
+            msg,
+            Style::default().fg(Color::DarkGray),
+        )));
+        return;
+    }
+    for event in shown.iter().take(MAX_FEED_SHOWN) {
+        lines.push(feed_line(event));
+    }
+    if shown.len() > MAX_FEED_SHOWN {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more", shown.len() - MAX_FEED_SHOWN),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
+fn feed_line(event: &FeedEvent) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {:<15}", format_ts(event.ts_text.as_deref())),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(" {:<24}", truncate(&event.repo, 24)),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!(" {:<16}", truncate(&event.workflow, 16)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(" {:<20}", truncate(&event.event, 20)),
+            Style::default().fg(event_color(event)),
+        ),
+        Span::raw(format!(" {:<12}", truncate(&event.target(), 12))),
+        Span::styled(
+            format!(" {}", truncate(&event.detail, 40)),
+            Style::default().fg(Color::Gray),
+        ),
+    ])
+}
+
+/// Feed event colors mirror the stage palette: in-flight dispatches and
+/// runs cyan, forward progress green, stops and blocking/failed outcomes
+/// red, unrecognized verdicts or gate shapes yellow, unknown event types
+/// gray.
+fn event_color(event: &FeedEvent) -> Color {
+    match event.event.as_str() {
+        "run_started" | "issue_dispatched" | "rework_dispatched" => Color::Cyan,
+        "pr_opened" | "merge_verified" | "issue_closed" => Color::Green,
+        "run_stopped" => Color::Red,
+        "review_verdict" => match event.detail.as_str() {
+            "clean" => Color::Green,
+            "blocking" => Color::Red,
+            _ => Color::Yellow,
+        },
+        "gate_result" => match event.detail.as_str() {
+            "passed" => Color::Green,
+            "failed" => Color::Red,
+            _ => Color::Yellow,
+        },
+        _ => Color::Gray,
+    }
+}
+
+/// Compact timestamp for the feed: "MM-DD HH:MM:SS" taken from the
+/// journal's RFC3339 `ts`. A malformed `ts` renders verbatim (truncated)
+/// and a missing one as "—", never as a wrong time.
+fn format_ts(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return "—".to_string();
+    };
+    if let Some((date, time)) = raw.split_once('T') {
+        if date.len() == 10 && time.len() >= 8 {
+            return format!("{} {}", &date[5..], &time[..8]);
+        }
+    }
+    truncate(raw, 15)
+}
+
+/// Cycles the activity-feed repo filter: all → first repo → … → last
+/// repo → all. A filter naming a repo that has since left the board
+/// resets to all on the next cycle.
+fn next_filter(current: &Option<String>, repos: &[String]) -> Option<String> {
+    match current {
+        None => repos.first().cloned(),
+        Some(r) => match repos.iter().position(|x| x == r) {
+            Some(i) => repos.get(i + 1).cloned(),
+            None => None,
+        },
+    }
 }
 
 fn render_repo(repo: &RepoView, lines: &mut Vec<Line<'static>>) {
@@ -772,8 +919,9 @@ mod tests {
             agents: Ok(vec![]),
             groups: vec![],
             inbox: vec![],
+            feed: vec![],
         };
-        let all: String = render(&board).iter().map(line_text).collect();
+        let all: String = render(&board, None).iter().map(line_text).collect();
         assert!(all.contains("WAITING ON YOU (0)"));
         assert!(all.contains("nothing waiting on you"));
     }
@@ -787,8 +935,9 @@ mod tests {
             agents: Ok(vec![]),
             groups: vec![],
             inbox: vec![parked],
+            feed: vec![],
         };
-        let lines = render(&board);
+        let lines = render(&board, None);
         let all: Vec<String> = lines.iter().map(line_text).collect();
         assert!(all.iter().any(|t| t.contains("WAITING ON YOU (1)")));
         let row = all.iter().find(|t| t.contains("PR #20")).expect("item row");
@@ -806,12 +955,15 @@ mod tests {
             agents: Err("server not running".to_string()),
             groups: vec![],
             inbox: vec![],
+            feed: vec![],
         };
-        let all: String = render(&board).iter().map(line_text).collect();
+        let all: String = render(&board, None).iter().map(line_text).collect();
         assert!(all.contains("herdr unreachable"));
         // With no live repo set, claiming an empty inbox would be false.
         assert!(!all.contains("WAITING ON YOU"));
         assert!(!all.contains("nothing waiting on you"));
+        // Same for the feed: no section at all.
+        assert!(!all.contains("ACTIVITY"));
     }
 
     #[test]
@@ -822,13 +974,135 @@ mod tests {
             inbox: (1..=(MAX_INBOX_SHOWN + 3) as u64)
                 .map(|n| inbox_item(InboxKind::TrackerInput, crate::inbox::Target::Issue(n)))
                 .collect(),
+            feed: vec![],
         };
-        let all: String = render(&board).iter().map(line_text).collect();
+        let all: String = render(&board, None).iter().map(line_text).collect();
         assert!(all.contains("+3 more"));
         assert_eq!(
             all.matches("the title").count(),
             MAX_INBOX_SHOWN,
             "only the capped number of item rows render"
         );
+    }
+
+    // --- activity feed ---
+
+    fn jev(event: &str, issue: u64, ts: &str) -> journal::Event {
+        journal::Event {
+            run_id: "r1".to_string(),
+            workflow: "operator-run".to_string(),
+            event: event.to_string(),
+            issue: Some(issue),
+            ts: Some(ts.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn feed_board(events: Vec<(String, Vec<journal::Event>)>) -> Dashboard {
+        Dashboard {
+            agents: Ok(vec![]),
+            groups: vec![],
+            inbox: vec![],
+            feed: feed::build_feed(
+                events
+                    .iter()
+                    .map(|(repo, ev)| (repo.clone(), ev.as_slice())),
+            ),
+        }
+    }
+
+    #[test]
+    fn feed_renders_ts_repo_workflow_event_target_and_detail() {
+        let mut stop = jev("run_stopped", 7, "2026-09-24T18:52:28.183Z");
+        stop.pr = Some(20);
+        stop.data = Some(serde_json::json!({"reason": "PR not green"}));
+        let board = feed_board(vec![("o/repo".to_string(), vec![stop])]);
+        let lines = render(&board, None);
+        let all: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(all.iter().any(|t| t.contains("ACTIVITY (all repos)")));
+        let row = all
+            .iter()
+            .find(|t| t.contains("run_stopped"))
+            .expect("feed row");
+        assert!(row.contains("09-24 18:52:28"), "compact timestamp: {row}");
+        assert!(row.contains("o/repo"));
+        assert!(row.contains("operator-run"));
+        assert!(row.contains("#7 PR #20"));
+        assert!(row.contains("PR not green"), "salient detail: {row}");
+    }
+
+    #[test]
+    fn feed_newest_first_across_repos_with_explicit_empty_state() {
+        let a = vec![jev("run_started", 1, "2026-09-24T18:00:00Z")];
+        let b = vec![jev("pr_opened", 2, "2026-09-24T18:10:00Z")];
+        let board = feed_board(vec![("o/a".to_string(), a), ("o/b".to_string(), b)]);
+        let lines = render(&board, None);
+        let all: Vec<String> = lines.iter().map(line_text).collect();
+        let opened = all.iter().position(|t| t.contains("pr_opened")).unwrap();
+        let started = all.iter().position(|t| t.contains("run_started")).unwrap();
+        assert!(opened < started, "newest event renders first");
+        // A repo with an empty journal contributes no lines and no error.
+        let board = feed_board(vec![("o/a".to_string(), vec![])]);
+        let all: String = render(&board, None).iter().map(line_text).collect();
+        assert!(all.contains("no journal events yet"));
+    }
+
+    #[test]
+    fn feed_filter_shows_one_repo_and_names_it_in_the_header() {
+        let a = vec![jev("run_started", 1, "2026-09-24T18:00:00Z")];
+        let b = vec![jev("pr_opened", 2, "2026-09-24T18:10:00Z")];
+        let board = feed_board(vec![("o/a".to_string(), a), ("o/b".to_string(), b)]);
+        let all: String = render(&board, Some("o/a")).iter().map(line_text).collect();
+        assert!(all.contains("ACTIVITY (o/a)"));
+        assert!(all.contains("run_started"));
+        assert!(!all.contains("pr_opened"), "other repo filtered out");
+        // A filter naming a repo with no events says so explicitly.
+        let all: String = render(&board, Some("o/missing"))
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(all.contains("no journal events for o/missing"));
+    }
+
+    #[test]
+    fn feed_tail_collapses_beyond_cap() {
+        let events: Vec<journal::Event> = (0..(MAX_FEED_SHOWN + 3) as u64)
+            .map(|n| jev("run_started", n, "2026-09-24T18:00:00Z"))
+            .collect();
+        let board = feed_board(vec![("o/a".to_string(), events)]);
+        let all: String = render(&board, None).iter().map(line_text).collect();
+        assert!(all.contains("+3 more"));
+    }
+
+    #[test]
+    fn filter_cycles_all_through_each_repo_and_back() {
+        let repos = vec!["o/a".to_string(), "o/b".to_string()];
+        let mut filter = None;
+        filter = next_filter(&filter, &repos);
+        assert_eq!(filter.as_deref(), Some("o/a"));
+        filter = next_filter(&filter, &repos);
+        assert_eq!(filter.as_deref(), Some("o/b"));
+        filter = next_filter(&filter, &repos);
+        assert_eq!(filter, None, "cycles back to all");
+        // A filter naming a departed repo resets to all.
+        let stale = Some("o/gone".to_string());
+        assert_eq!(next_filter(&stale, &repos), None);
+        // No repos on the board: the filter stays at all.
+        assert_eq!(next_filter(&None, &[]), None);
+    }
+
+    #[test]
+    fn format_ts_renders_compact_or_degrades() {
+        assert_eq!(
+            format_ts(Some("2026-09-24T18:52:28.183Z")),
+            "09-24 18:52:28"
+        );
+        assert_eq!(
+            format_ts(Some("2026-09-24T18:52:28+02:00")),
+            "09-24 18:52:28"
+        );
+        assert_eq!(format_ts(None), "—");
+        // A malformed ts renders verbatim, truncated, never as a wrong time.
+        assert_eq!(format_ts(Some("not a timestamp")), "not a timestamp");
     }
 }

@@ -2,7 +2,8 @@
 
 A herdr plugin that shows a live dashboard of [Flock](https://github.com/andybarilla/flock)-managed
 agent work: open issues by workflow state, which agents are running and where
-each issue is in its workflow, and what is waiting on the human — across every
+each issue is in its workflow, what is waiting on the human, and a
+reverse-chronological activity feed of workflow events — across every
 repo active in the herdr session.
 
 Status: **waiting-on-you inbox**. The dashboard TUI shows every agent in
@@ -20,7 +21,16 @@ stopped operator runs whose reason needs human action, and open issues
 labeled `needs-info`/`needs-triage`. Each item names its repo, issue/PR,
 reason, and age; blocking/stopped items sort first, then merge-ready, then
 informational; an empty inbox says so explicitly, and items clear on the
-next refresh as their condition resolves. Read-only.
+next refresh as their condition resolves. An **activity** section below
+the inbox shows a reverse-chronological cross-repo feed of workflow
+events (dispatches, PR opens, review verdicts, gate results, stops) built
+from every discovered repo's journal, ordered by event timestamp, one
+line per event with its repo, workflow, issue/PR, and the salient detail
+(stop reason, verdict, gate result, dispatch target). The feed tails the
+journals on the normal poll cycle, holds only the most recent 500 events
+per repo, and the `f` key cycles a per-repo filter (including "all")
+that persists for the pane session; empty journals render an explicit
+empty state. Read-only.
 
 ## Install
 
@@ -85,6 +95,8 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
   repo's live checkouts on every agent poll, correlated with PR
   checks/mergeability (using the project-config green classifier:
   SKIPPED/NEUTRAL satisfied, unknown fail-closed) and herdr agent liveness.
+  The same per-poll read feeds the cross-repo activity feed, so new events
+  appear on the poll cycle without any second cache layer.
   The reader is tolerant — a missing, truncated, corrupted (non-UTF-8), or
   forward-versioned journal
   degrades to label/PR-inferred stages rather than blanking the board — and a
@@ -103,7 +115,7 @@ The plugin exposes actions for opening the dashboard pane in a split or a tab.
 3. ~~Per-issue workflow stage view (reads the Flock event journal).~~
 4. ~~"Waiting on me" inbox: blocking reviews, parked PRs, stopped runs,
    needs-info items.~~
-5. Cross-repo activity feed (scuttlebutt-style).
+5. ~~Cross-repo activity feed (scuttlebutt-style).~~
 
 ## Development
 
