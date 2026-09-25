@@ -290,7 +290,10 @@ pub struct RepoSlot {
     /// currently in the `GONE_GRACE` retention window.
     pub gone_since: Option<Instant>,
     /// The repo's parsed Flock journal, re-read after each successful sync.
-    /// Empty when no live checkout has a readable journal.
+    /// Empty when no live checkout has a readable journal. Bounded at the
+    /// reader: the production reader (`journal::read_repo_events`) retains
+    /// only the newest `journal::MAX_JOURNAL_EVENTS` events, so this cache
+    /// stays flat as append-only journals grow.
     pub journal: Arc<Vec<journal::Event>>,
     pub issues: Option<Result<Vec<Issue>, String>>,
     pub prs: Option<Result<Vec<PullRequest>, String>>,
@@ -431,7 +434,12 @@ impl SlotCache {
     /// slots keep reading from their last live checkouts, so a died run's
     /// terminal event is picked up as soon as a supervisor writes it.
     /// Non-GitHub slots have no issue/PR surface, but their journals still
-    /// feed the cross-repo activity feed, so they are read too.
+    /// feed the cross-repo activity feed, so they are read too. Memory and
+    /// parse cost stay bounded as journals grow: the production reader
+    /// (`journal::read_repo_events`) parses and retains only the newest
+    /// `journal::MAX_JOURNAL_EVENTS` lines per repo — far above the feed's
+    /// per-repo view cap, so in-flight issues keep their stage/inbox facts
+    /// (see the constant's doc for the residual edge).
     pub fn refresh_journals(&mut self, reader: &dyn Fn(&BTreeSet<PathBuf>) -> Vec<journal::Event>) {
         for slot in self.slots.values_mut() {
             slot.journal = Arc::new(reader(&slot.cwds));
@@ -1396,6 +1404,140 @@ mod tests {
         let local = &cache.slots[&SlotKey::Local(PathBuf::from("/dev/a/local"))];
         assert_eq!(local.journal.len(), 1, "local slots read journals too");
         assert_eq!(local.journal[0].issue, Some(4));
+    }
+
+    /// Writes `text` as the Flock journal of a fresh tempdir checkout,
+    /// returning the dir guard (keeps the files alive) and the checkout
+    /// path for use as an agent cwd.
+    fn journal_checkout(text: String) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".flock")).unwrap();
+        std::fs::write(dir.path().join(".flock/events.jsonl"), text).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        (dir, cwd)
+    }
+
+    fn journal_line(run: &str, event: &str, issue: u64, extra: &str) -> String {
+        format!(
+            "{{\"run_id\":\"{run}\",\"workflow\":\"operator-run\",\"event\":\"{event}\",\"repo\":\"o/one\",\"issue\":{issue}{extra}}}\n"
+        )
+    }
+
+    #[test]
+    fn journal_cache_is_bounded_and_feed_view_stays_capped() {
+        // A long-lived repo whose journal has grown past the reader bound:
+        // the slot cache must not retain the whole file, and the dashboard
+        // feed stays at its per-repo view cap.
+        let total = journal::MAX_JOURNAL_EVENTS + 100;
+        let mut text = String::new();
+        for i in 0..total {
+            text.push_str(&journal_line(
+                &format!("r{i}"),
+                "run_started",
+                1,
+                ",\"ts\":\"2026-09-24T18:00:00Z\"",
+            ));
+        }
+        let (_dir, cwd) = journal_checkout(text);
+        let rows = agent_rows(vec![info("working", &cwd)]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(&rows, &mut lookup, Instant::now());
+        // The production reader, not a test fake: the bound must hold at
+        // the reader/cache boundary refresh_journals calls through.
+        cache.refresh_journals(&journal::read_repo_events);
+        let slot = &cache.slots[&github_key("o/one")];
+        assert_eq!(
+            slot.journal.len(),
+            journal::MAX_JOURNAL_EVENTS,
+            "the cache retains only the bounded newest tail, not the whole {total}-event journal"
+        );
+        assert_eq!(
+            slot.journal.last().unwrap().run_id,
+            format!("r{}", total - 1)
+        );
+        let dash = dashboard(Ok(rows), &cache);
+        assert_eq!(
+            dash.feed.len(),
+            feed::MAX_EVENTS_PER_REPO,
+            "the feed view keeps its own per-repo cap"
+        );
+    }
+
+    #[test]
+    fn in_flight_issue_facts_survive_the_bounded_journal_tail() {
+        // Regression for the cache bound: an older in-flight issue whose
+        // events sit just inside the retained tail must keep its stage and
+        // inbox facts even though newer events (from other issues) follow
+        // them and the file head was dropped.
+        let total = journal::MAX_JOURNAL_EVENTS + 100;
+        let mut text = String::new();
+        // The dropped head: an ancient closed issue's noise.
+        for i in 0..100 {
+            text.push_str(&journal_line(&format!("old{i}"), "run_started", 1, ""));
+        }
+        // The oldest retained lines: issue 7's in-flight facts — dispatch
+        // to the live agent's pane, PR opened, latest verdict blocking.
+        text.push_str(&journal_line(
+            "r7",
+            "issue_dispatched",
+            7,
+            ",\"data\":{\"workspace_id\":\"w1\",\"pane_id\":\"w1:p-working\"}",
+        ));
+        text.push_str(&journal_line(
+            "r7",
+            "pr_opened",
+            7,
+            ",\"pr\":20,\"branch\":\"flock/issue-7-thing\"",
+        ));
+        text.push_str(&journal_line(
+            "r7",
+            "review_verdict",
+            7,
+            ",\"data\":{\"verdict\":\"blocking\"}",
+        ));
+        // Newer filler from a different issue: it must neither push issue
+        // 7's facts out of the tail nor supersede its verdict.
+        for i in 103..total {
+            text.push_str(&journal_line(&format!("r{i}"), "run_started", 9, ""));
+        }
+        let (_dir, cwd) = journal_checkout(text);
+        let rows = agent_rows(vec![info("working", &cwd)]);
+        let mut cache = SlotCache::default();
+        let mut lookup = |_: &Path| github_remote("o/one");
+        cache.sync(&rows, &mut lookup, Instant::now());
+        cache.refresh_journals(&journal::read_repo_events);
+        let slot = &cache.slots[&github_key("o/one")];
+        assert_eq!(slot.journal.len(), journal::MAX_JOURNAL_EVENTS);
+        let ticket = due_ticket(&cache, "o/one", Instant::now());
+        assert!(cache.record_fetch(
+            &ticket,
+            Ok(vec![numbered_issue(7, &[]), numbered_issue(9, &[])]),
+            Ok(vec![pr_on_branch(20, "flock/issue-7-thing", "MERGEABLE")]),
+            Instant::now(),
+        ));
+        let dash = dashboard(Ok(rows), &cache);
+        let view = &dash.groups[0].repos[0];
+        let issue_rows = view.issue_rows.as_ref().unwrap().as_ref().unwrap();
+        let stage = |n: u64| {
+            issue_rows
+                .iter()
+                .find(|r| r.number == n)
+                .unwrap()
+                .stage
+                .clone()
+        };
+        // Issue 7's blocking verdict survived the bound: the stage and the
+        // blocking-review inbox item derive exactly as without a cap.
+        assert_eq!(stage(7), journal::Stage::ReviewBlocking);
+        assert_eq!(stage(9), journal::Stage::None);
+        let blocking: Vec<_> = dash
+            .inbox
+            .iter()
+            .filter(|i| i.kind == inbox::InboxKind::BlockingReview)
+            .collect();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].target, inbox::Target::Pr(20));
     }
 
     #[test]

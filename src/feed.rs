@@ -6,8 +6,10 @@
 //! uses (missing files, truncated tails, and unknown event names degrade
 //! to fewer events, never to an error), so the feed tails the journals
 //! on the normal refresh cycle with no state of its own. The journal
-//! file is append-only and never touched; the per-repo bound drops old
-//! events from the view only.
+//! file is append-only and never touched; the slot cache holds only the
+//! bounded newest tail (`journal::MAX_JOURNAL_EVENTS`, applied at the
+//! reader so retained memory and per-poll parse work stay flat), and the
+//! per-repo bound below drops old events from the view only.
 
 use std::cmp::Ordering;
 use std::time::SystemTime;
@@ -15,10 +17,12 @@ use std::time::SystemTime;
 use crate::inbox::parse_ts;
 use crate::journal::Event;
 
-/// Most recent journal events held per repo. Journals are append-only,
+/// Most recent journal events shown per repo. Journals are append-only,
 /// so the newest events are the file's tail; older events are dropped
-/// from the view (never from the file) to keep memory bounded no matter
-/// how long a session runs.
+/// from the view (never from the file) to keep the rendered feed small.
+/// The slot cache itself is bounded separately and much more loosely at
+/// the reader (`journal::MAX_JOURNAL_EVENTS`), so stage/inbox derivation
+/// keeps history far beyond this window.
 pub const MAX_EVENTS_PER_REPO: usize = 500;
 
 /// One feed line: a journal event plus the repo it came from.
