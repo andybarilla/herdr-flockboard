@@ -247,6 +247,40 @@ mod tests {
     }
 
     #[test]
+    fn malformed_numeric_timestamps_never_panic_and_sort_last() {
+        // Corrupt journal `ts` values whose components are numeric but
+        // absurd (huge year, huge offset, out-of-range fields) parse to
+        // None via checked arithmetic — no overflow panic in debug
+        // builds, no wrapped bogus SystemTime in release — and sort
+        // after every timestamped event.
+        let events = vec![
+            ev("r1", "run_started", "2026-09-24T18:00:00Z"),
+            ev("r1", "gate_result", "999999999-09-24T18:00:00Z"),
+            ev(
+                "r1",
+                "pr_opened",
+                "2026-09-24T18:00:00+9999999999999999999:00",
+            ),
+            ev("r1", "run_stopped", "2026-13-32T99:99:99Z"),
+            ev("r1", "issue_closed", "2026-09-24T18:30:00Z"),
+        ];
+        let feed = build_feed(vec![("o/a".to_string(), events.as_slice())]);
+        assert_eq!(feed.len(), 5);
+        assert_eq!(
+            feed_lines(&feed),
+            vec![
+                ("o/a", "issue_closed"),
+                ("o/a", "run_started"),
+                // The malformed lines keep journal order among
+                // themselves, later line first.
+                ("o/a", "run_stopped"),
+                ("o/a", "pr_opened"),
+                ("o/a", "gate_result"),
+            ]
+        );
+    }
+
+    #[test]
     fn equal_timestamps_tie_break_deterministically() {
         let ts = "2026-09-24T18:00:00Z";
         let a = vec![ev("r1", "run_started", ts), ev("r1", "run_stopped", ts)];
